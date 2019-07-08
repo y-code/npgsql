@@ -141,37 +141,6 @@ namespace Npgsql.Tests
                 conn3.Open();
         }
 
-        [Test]
-        public void OverflowExceptionWhenTooManyWaiting()
-        {
-            var connString = new NpgsqlConnectionStringBuilder(ConnectionString) 
-            {
-                ApplicationName = nameof(OverflowExceptionWhenTooManyWaiting),
-                MaxPoolSize = 1,
-            }.ToString();
-
-            using (var conn = new NpgsqlConnection(connString))
-            {
-                conn.Open();
-                Assert.True(PoolManager.TryGetValue(connString, out var pool));
-                var state = pool!.State;
-
-                try
-                {
-                    var newState = state;
-                    newState.Waiting = int.MaxValue;
-                    pool!.State = newState;
-                    var conn2 = new NpgsqlConnection(connString);
-                    Assert.Catch<OverflowException>(() => conn2.Open());
-                }
-                finally
-                {
-                    // Restore state for the closes work correctly.
-                    pool!.State = state;
-                }
-            }
-        }
-
         //[Test, Timeout(10000)]
         //[Explicit("Timing-based")]
         public async Task CancelOpenAsync()
@@ -410,7 +379,6 @@ namespace Npgsql.Tests
             var state = pool.State;
             Assert.That(state.Idle, Is.EqualTo(idle), $"Idle should be {idle} but is {state.Idle}");
             Assert.That(state.Busy, Is.EqualTo(busy), $"Busy should be {busy} but is {state.Busy}");
-            Assert.That(state.Waiting, Is.EqualTo(waiting), $"Waiting should be {waiting} but is {state.Waiting}");
         }
     }
 }
