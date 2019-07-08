@@ -222,15 +222,12 @@ namespace Npgsql
                         conn.Connector = null;
                         Interlocked.Decrement(ref State.Busy);
 
-                        // There may be waiters because we raised the busy count (and failed). Release one
-                        // waiter if there is one.
-                        if (_waiting.TryDequeue(out var waitingOpenAttempt))
-                        {
-                            if (!waitingOpenAttempt.TaskCompletionSource.TrySetResult(null))
-                            {
-                                // TODO: Release more??
-                            }
-                        }
+                        // There may be waiters because we raised the busy count (and failed).
+                        // Unblock exactly one waiter if there is one.
+                        // We loop until we find one as we could try to unblock an already cancelled waiter.
+                        // Which won't help to unblock an 'incomplete' waiter that should retry for an open itself.
+                        while(_waiting.TryDequeue(out var waitingOpenAttempt) && !waitingOpenAttempt.TaskCompletionSource.TrySetResult(null))
+                        {}
 
                         throw;
                     }
