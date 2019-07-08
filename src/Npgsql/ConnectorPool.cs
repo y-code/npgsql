@@ -298,11 +298,10 @@ namespace Npgsql
                     // At this point the waiting count is non-zero, so new release calls are blocking on the waiting
                     // queue. This avoids a race condition where we wait while another connector is put back in the
                     // idle list - we know the idle list is empty and will stay empty.
-
                     try
                     {
                         // Enqueue an open attempt into the waiting queue so that the next release attempt will unblock us.
-                        var tcs = new TaskCompletionSource<NpgsqlConnector?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        var tcs = new TaskCompletionSource<NpgsqlConnector?>();
                         _waiting.Enqueue((tcs, async));
 
                         try
@@ -360,16 +359,6 @@ namespace Npgsql
 
                         Debug.Assert(tcs.Task.IsCompleted);
                         connector = tcs.Task.Result;
-
-                        // Our task completion may contain a null in order to unblock us, allowing us to try
-                        // allocating again.
-                        if (connector == null)
-                            continue;
-
-                        // Note that we don't update counters or any state since the connector is being
-                        // handed off from one open connection to another.
-                        connector.Connection = conn;
-                        return connector;
                     }
                     finally
                     {
@@ -386,6 +375,21 @@ namespace Npgsql
                             sw.SpinOnce();
                         }
                     }
+
+                    // Do this outside the try finally so we execute our state.Waiting decrement inline.
+                    // But do make sure we don't run user code inline.
+                    if (async)
+                        await Task.Yield();
+
+                    // Our task completion may contain a null in order to unblock us, allowing us to try
+                    // allocating again.
+                    if (connector == null)
+                        continue;
+
+                    // Note that we don't update counters or any state since the connector is being
+                    // handed off from one open connection to another.
+                    connector.Connection = conn;
+                    return connector;
                 }
 
                 // We didn't create a new connector or start waiting, which means there's a new idle connector, try
