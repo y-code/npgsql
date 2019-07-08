@@ -57,9 +57,9 @@ namespace Npgsql
         internal struct PoolState
         {
             [FieldOffset(0)]
-            internal short Idle;
-            [FieldOffset(2)]
-            internal short Busy;
+            internal int Idle;
+            [FieldOffset(4)]
+            internal int Busy;
             [FieldOffset(0)]
             internal long All;
 
@@ -209,14 +209,7 @@ namespace Npgsql
                 if (state.Total < _max)
                 {
                     // We're under the pool's max capacity, try to "allocate" a slot for a new physical connection.
-                    newState.Busy++;
-                    CheckInvariants(newState);
-                    if (Interlocked.CompareExchange(ref State.All, newState.All, state.All) != state.All)
-                    {
-                        // Our attempt to increment the busy count failed, Loop again and retry.
-                        continue;
-                    }
-
+                    Interlocked.Increment(ref State.Busy);
                     try
                     {
                         // We've managed to increase the busy counter, open a physical connections
@@ -227,22 +220,7 @@ namespace Npgsql
                     {
                         // Physical open failed, decrement busy back down
                         conn.Connector = null;
-
-                        var sw = new SpinWait();
-                        while (true)
-                        {
-                            state = State.Copy();
-                            newState = state;
-                            newState.Busy--;
-                            if (Interlocked.CompareExchange(ref State.All, newState.All, state.All) != state.All)
-                            {
-                                // Our attempt to increment the busy count failed, Loop again and retry.
-                                sw.SpinOnce();
-                                continue;
-                            }
-
-                            break;
-                        }
+                        Interlocked.Decrement(ref State.Busy);
 
                         // There may be waiters because we raised the busy count (and failed). Release one
                         // waiter if there is one.
@@ -408,12 +386,8 @@ namespace Npgsql
 
             connector.Reset();
 
-            var sw = new SpinWait();
-
             while (true)
             {
-                var state = State.Copy();
-
                 // If there are any pending open attempts in progress hand the connector off to them directly.
                 // Note that in this case, state changes happens at the allocating side.
                 if (_waiting.TryDequeue(out var waitingOpenAttempt))
@@ -436,6 +410,7 @@ namespace Npgsql
                 // may occur as we're putting our connector into the idle list. Decrement the busy
                 // count, while atomically make sure the waiting count isn't increased.
                 // Note that we also must update the state *before* putting the connector back in the idle list.
+                var state = State.Copy();
                 var newState = state;
                 newState.Idle++;
                 newState.Busy--;
@@ -456,7 +431,7 @@ namespace Npgsql
                 // too much interlocked operations "contention" at the beginning.
                 var start = Thread.CurrentThread.ManagedThreadId % _max;
 
-                sw = new SpinWait();
+                var sw = new SpinWait();
                 while (true)
                 {
                     for (var i = start; i < _idle.Length; i++)
@@ -487,20 +462,10 @@ namespace Npgsql
             {
                 connector.Close();
 
-                var sw = new SpinWait();
-                while (true)
-                {
-                    var state = State.Copy();
-                    var newState = state;
-                    if (wasIdle)
-                        newState.Idle--;
-                    else
-                        newState.Busy--;
-                    CheckInvariants(newState);
-                    if (Interlocked.CompareExchange(ref State.All, newState.All, state.All) == state.All)
-                        break;
-                    sw.SpinOnce();
-                }
+                if (wasIdle)
+                    Interlocked.Decrement(ref State.Idle);
+                else
+                    Interlocked.Decrement(ref State.Busy);
             }
             catch (Exception e)
             {
@@ -529,7 +494,7 @@ namespace Npgsql
 
             for (var i = 0; i < idle.Length; i++)
             {
-                if (pool.State.Total <= pool._min)
+                if (pool.State.Copy().Total <= pool._min)
                     return;
 
                 var connector = idle[i];
@@ -612,7 +577,7 @@ namespace Npgsql
 
         public void Dispose() => _pruningTimer?.Dispose();
 
-        public override string ToString() => State.ToString();
+        public override string ToString() => State.Copy().ToString();
 
         #endregion Misc
     }
