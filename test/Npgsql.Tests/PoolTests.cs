@@ -14,7 +14,7 @@ namespace Npgsql.Tests
         [Test]
         public void MinPoolSizeEqualsMaxPoolSize()
         {
-            using (var conn = new NpgsqlConnection(new NpgsqlConnectionStringBuilder(ConnectionString) 
+            using (var conn = new NpgsqlConnection(new NpgsqlConnectionStringBuilder(ConnectionString)
             {
                 MinPoolSize = 30,
                 MaxPoolSize = 30
@@ -59,7 +59,7 @@ namespace Npgsql.Tests
         [Test, Timeout(10000)]
         public void GetConnectorFromExhaustedPool()
         {
-            var connString = new NpgsqlConnectionStringBuilder(ConnectionString) 
+            var connString = new NpgsqlConnectionStringBuilder(ConnectionString)
             {
                 MaxPoolSize = 1,
                 Timeout = 0
@@ -101,7 +101,7 @@ namespace Npgsql.Tests
         [Test]
         public void TimeoutGettingConnectorFromExhaustedPool()
         {
-            var connString = new NpgsqlConnectionStringBuilder(ConnectionString) 
+            var connString = new NpgsqlConnectionStringBuilder(ConnectionString)
             {
                 MaxPoolSize = 1,
                 Timeout = 2
@@ -145,7 +145,7 @@ namespace Npgsql.Tests
         //[Explicit("Timing-based")]
         public async Task CancelOpenAsync()
         {
-            var connString = new NpgsqlConnectionStringBuilder(ConnectionString) 
+            var connString = new NpgsqlConnectionStringBuilder(ConnectionString)
             {
                 ApplicationName = nameof(CancelOpenAsync),
                 MaxPoolSize = 1,
@@ -307,7 +307,7 @@ namespace Npgsql.Tests
         [Test]
         public void ClearWithNoPool()
         {
-            var connString = new NpgsqlConnectionStringBuilder(ConnectionString) 
+            var connString = new NpgsqlConnectionStringBuilder(ConnectionString)
             {
                 ApplicationName = nameof(ClearWithNoPool)
             }.ToString();
@@ -318,7 +318,7 @@ namespace Npgsql.Tests
         [Test, Description("https://github.com/npgsql/npgsql/commit/45e33ecef21f75f51a625c7b919a50da3ed8e920#r28239653")]
         public void PhysicalOpenFailure()
         {
-            var connString = new NpgsqlConnectionStringBuilder(ConnectionString) 
+            var connString = new NpgsqlConnectionStringBuilder(ConnectionString)
             {
                 ApplicationName = nameof(PhysicalOpenFailure),
                 Port = 44444,
@@ -342,7 +342,7 @@ namespace Npgsql.Tests
         //[TestCase(10, 20, 30, false)]
         public void ExercisePool(int maxPoolSize, int numTasks, int seconds, bool async)
         {
-            var connString = new NpgsqlConnectionStringBuilder(ConnectionString) 
+            var connString = new NpgsqlConnectionStringBuilder(ConnectionString)
             {
                 ApplicationName = nameof(ExercisePool),
                 MaxPoolSize = maxPoolSize

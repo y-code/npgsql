@@ -63,14 +63,15 @@ namespace Npgsql
             [FieldOffset(0)]
             internal long All;
 
-            internal int Total => Idle + Busy;
+            [FieldOffset(8)]
+            internal int Open;
 
             internal PoolState Copy() => new PoolState { All = Volatile.Read(ref All) };
 
             public override string ToString()
             {
                 var state = Copy();
-                return $"[{state.Total} total, {state.Idle} idle, {state.Busy} busy]";
+                return $"[{state.Open} total, {state.Idle} idle, {state.Busy} busy]";
             }
         }
 
@@ -174,18 +175,10 @@ namespace Npgsql
 
                 // We successfully extracted an idle connector, update state
                 Counters.NumberOfActiveConnections.Increment();
-                var sw = new SpinWait();
-                while (true)
-                {
-                    var state = State.Copy();
-                    var newState = state;
-                    newState.Busy++;
-                    newState.Idle--;
-                    CheckInvariants(newState);
-                    if (Interlocked.CompareExchange(ref State.All, newState.All, state.All) == state.All)
-                        return true;
-                    sw.SpinOnce();
-                }
+                Interlocked.Increment(ref State.Busy);
+                Interlocked.Decrement(ref State.Idle);
+                CheckInvariants(State);
+                return true;
             }
 
             connector = null;
@@ -203,62 +196,67 @@ namespace Npgsql
             while (true)
             {
                 NpgsqlConnector? connector;
-                var state = State.Copy();
-                var newState = state;
+                var openCount = Volatile.Read(ref State.Open);
 
-                if (state.Total < _max)
+                if (openCount < _max)
                 {
+                    var newOpenCount = openCount + 1;
                     // We're under the pool's max capacity, try to "allocate" a slot for a new physical connection.
-                    Interlocked.Increment(ref State.Busy);
+                    if (Interlocked.CompareExchange(ref State.Open, newOpenCount, openCount) != openCount)
+                    {
+                        // Our attempt to increment the open counter failed, loop again and retry.
+                        continue;
+                    }
+
                     try
                     {
-                        // We've managed to increase the busy counter, open a physical connections
+                        // We've managed to increase the open counter, open a physical connections.
                         connector = new NpgsqlConnector(conn) { ClearCounter = _clearCounter };
                         await connector.Open(timeout, async, cancellationToken);
+
+                        // Start the pruning timer if we're above MinPoolSize
+                        if (_pruningTimer == null && openCount > _min)
+                        {
+                            var newPruningTimer = new Timer(PruningTimerCallback, this, -1, -1);
+                            if (Interlocked.CompareExchange(ref _pruningTimer, newPruningTimer, null) == null)
+                                newPruningTimer.Change(_pruningInterval, _pruningInterval);
+                            else
+                            {
+                                // Someone beat us to it
+                                newPruningTimer.Dispose();
+                            }
+                        }
                     }
                     catch
                     {
-                        // Physical open failed, decrement busy back down
+                        // Physical open failed, decrement the open counter back down.
                         conn.Connector = null;
-                        Interlocked.Decrement(ref State.Busy);
-
-                        // There may be waiters because we raised the busy count (and failed).
-                        // Unblock exactly one waiter if there is one.
-                        // We loop until we find one as we could try to unblock an already cancelled waiter.
-                        // Which won't help to unblock an 'incomplete' waiter that should retry for an open itself.
-                        while(_waiting.TryDequeue(out var waitingOpenAttempt) && !waitingOpenAttempt.TaskCompletionSource.TrySetResult(null))
-                        {}
-
+                        Interlocked.Decrement(ref State.Open);
                         throw;
                     }
 
-                    Counters.NumberOfActiveConnections.Increment();
                     Counters.NumberOfPooledConnections.Increment();
-
-                    // Start the pruning timer if we're above MinPoolSize
-                    if (_pruningTimer == null && newState.Total > _min)
-                    {
-                        var newPruningTimer = new Timer(PruningTimerCallback, this, -1, -1);
-                        if (Interlocked.CompareExchange(ref _pruningTimer, newPruningTimer, null) == null)
-                            newPruningTimer.Change(_pruningInterval, _pruningInterval);
-                        else
-                        {
-                            // Someone beat us to it
-                            newPruningTimer.Dispose();
-                        }
-                    }
-
+                    Counters.NumberOfActiveConnections.Increment();
+                    Interlocked.Increment(ref State.Busy);
+                    CheckInvariants(State);
                     return connector;
                 }
 
-                if (state.Busy == _max)
+                if (Volatile.Read(ref State.Busy) == _max)
                 {
+                    // Scenario: pre-empted waiter
+                    // here
+
                     // Pool is exhausted.
-                    // Enqueue an open attempt into the waiting queue so that the next release attempt will unblock us.
+                    // Enqueue an allocate attempt into the waiting queue so that the next release will unblock us.
                     var tcs = new TaskCompletionSource<NpgsqlConnector?>();
                     _waiting.Enqueue((tcs, async));
 
-                    if (Volatile.Read(ref State.Idle) > 0)
+                    // Scenario: pre-empted waiter
+                    // By here we are visible to any releases that start, however we may have been pre-empted
+                    // right before we could signal to a running release we were going into the wait queue.
+                    // We do a correction for that right here after our own enqueue by re-checking Busy.
+                    if (Volatile.Read(ref State.Busy) < _max)
                     {
                         // If setting this fails we have been raced to completion by a Release().
                         // Otherwise we have an idle connector to try and race to.
@@ -325,23 +323,6 @@ namespace Npgsql
                             else
                                 tcs.Task.Wait();
                         }
-
-                        Debug.Assert(tcs.Task.IsCompleted);
-                        connector = tcs.Task.Result;
-
-                        // Make sure we don't run user code inline.
-                        if (async)
-                            await Task.Yield();
-
-                        // Our task completion may contain a null in order to unblock us, allowing us to try
-                        // allocating again.
-                        if (connector == null)
-                            continue;
-
-                        // Note that we don't update counters or any state since the connector is being
-                        // handed off from one open connection to another.
-                        connector.Connection = conn;
-                        return connector;
                     }
                     catch
                     {
@@ -355,11 +336,27 @@ namespace Npgsql
                         if (tcs.Task.Status != TaskStatus.RanToCompletion)
                             throw;
                     }
+
+                    // Note that we don't update counters since the connector is being
+                    // handed off from one open connection to another.
+                    Debug.Assert(tcs.Task.IsCompleted);
+                    connector = tcs.Task.Result;
+
+                    if (connector == null)
+                        continue;
+
+                    connector.Connection = conn;
+
+                    // Make sure we don't run user code inline.
+                    if (async)
+                        await Task.Yield();
+
+                    return connector;
                 }
 
                 // We didn't create a new connector or start waiting, which means there's a new idle connector, try
                 // getting it
-                Debug.Assert(state.Idle > 0);
+                Debug.Assert(Volatile.Read(ref State.Idle) > 0);
                 if (TryAllocateFast(conn, out connector))
                     return connector;
             }
@@ -385,13 +382,12 @@ namespace Npgsql
 
             while (true)
             {
-                // If there are any pending open attempts in progress hand the connector off to them directly.
-                // Note that in this case, state changes happens at the allocating side.
+                // If there are any pending waiters we hand the connector off to them directly.
                 if (_waiting.TryDequeue(out var waitingOpenAttempt))
                 {
                     var tcs = waitingOpenAttempt.TaskCompletionSource;
 
-                    // We have a pending open attempt. "Complete" it, handing off the connector.
+                    // We have a pending waiter. "Complete" it, handing off the connector.
                     if (!tcs.TrySetResult(connector))
                     {
                         // If the open attempt timed out, the Task's state will be set to Canceled and our
@@ -403,25 +399,14 @@ namespace Npgsql
                     return;
                 }
 
-                // There were no waiting attempts. However, there's a race condition where a new waiting attempt
-                // may occur as we're putting our connector into the idle list. Decrement the busy
-                // count, while atomically make sure the waiting count isn't increased.
-                // Note that we also must update the state *before* putting the connector back in the idle list.
-                var state = State.Copy();
-                var newState = state;
-                newState.Idle++;
-                newState.Busy--;
-                CheckInvariants(newState);
-                if (Interlocked.CompareExchange(ref State.All, newState.All, state.All) != state.All)
-                {
-                    // Our attempt to decrement the busy count failed, either because a waiting attempt has been added
-                    // or busy has changed. Loop again and retry.
-                    continue;
-                }
+                // Scenario: pre-empted release
+                // Right here between our check for waiters and our signalling decrement for storing
+                // a connector there could have been an awaiter enqueueing, we compensate at the end.
 
-                // If we're here, we successfully applied the new state above and can put the connector back in the idle
-                // list (there were no pending open attempts).
-
+                // If we're here, we put the connector back in the idle list
+                // We decrement Busy, any allocate that is racing us will not match Busy == _max
+                // and will not enqueue but try to get our connector.
+                Interlocked.Decrement(ref State.Busy);
                 connector.ReleaseTimestamp = DateTime.UtcNow;
 
                 // We start scanning for an empty slot in "random" places in the array, to avoid
@@ -429,27 +414,52 @@ namespace Npgsql
                 var start = Thread.CurrentThread.ManagedThreadId % _max;
 
                 var sw = new SpinWait();
-                while (true)
+                var success = false;
+                while (!success)
                 {
                     for (var i = start; i < _idle.Length; i++)
                     {
                         if (Interlocked.CompareExchange(ref _idle[i], connector, null) == null)
                         {
                             Counters.NumberOfFreeConnections.Increment();
-                            return;
+                            success = true;
+                            break;
                         }
                     }
 
-                    for (var i = 0; i < start; i++)
+                    if (!success)
                     {
-                        if (Interlocked.CompareExchange(ref _idle[i], connector, null) == null)
+                        for (var i = 0; i < start; i++)
                         {
-                            Counters.NumberOfFreeConnections.Increment();
-                            return;
+                            if (Interlocked.CompareExchange(ref _idle[i], connector, null) == null)
+                            {
+                                Counters.NumberOfFreeConnections.Increment();
+                                success = true;
+                                break;
+                            }
                         }
+
+                        sw.SpinOnce();
                     }
-                    sw.SpinOnce();
                 }
+
+                // Finally increment idle after we stored the connector
+                Interlocked.Increment(ref State.Idle);
+                CheckInvariants(State);
+
+                // Scenario: pre-empted release
+                // Unblock any potential waiter that raced us by handing it a null result.
+                // We try to complete exactly one waiter as long as there are any the queue.
+                while(_waiting.TryDequeue(out var racedWaiter))
+                {
+                    if (racedWaiter.TaskCompletionSource.TrySetResult(null))
+                        break;
+                }
+
+                // Scenario: pre-empted waiter
+                // Could have a pre-empted waiter, that didn't enqueue yet waking up right after
+                // our correcting dequeue, it will do a check itself after enqueue for Busy < _max.
+                return;
             }
         }
 
@@ -459,19 +469,25 @@ namespace Npgsql
             {
                 connector.Close();
 
+                // REVIEW: Do we want this?
+                // Keep these decrements inside the try, if a connector fails to close we want to respect
+                // the actual maximum connections to the postgres server, not pretend we actually freed one.
                 if (wasIdle)
                     Interlocked.Decrement(ref State.Idle);
                 else
                     Interlocked.Decrement(ref State.Busy);
+
+                Interlocked.Decrement(ref State.Open);
+                CheckInvariants(State);
+
+                Counters.NumberOfPooledConnections.Decrement();
             }
             catch (Exception e)
             {
                 Log.Warn("Exception while closing outdated connector", e, connector.Id);
             }
 
-            Counters.NumberOfPooledConnections.Decrement();
-
-            while (_pruningTimer != null && State.Total <= _min)
+            while (_pruningTimer != null && Volatile.Read(ref State.Open) <= _min)
             {
                 var oldTimer = _pruningTimer;
                 if (Interlocked.CompareExchange(ref _pruningTimer, null, oldTimer) == oldTimer)
@@ -491,7 +507,7 @@ namespace Npgsql
 
             for (var i = 0; i < idle.Length; i++)
             {
-                if (pool.State.Copy().Total <= pool._min)
+                if (Volatile.Read(ref pool.State.Open) <= pool._min)
                     return;
 
                 var connector = idle[i];
@@ -564,8 +580,10 @@ namespace Npgsql
         [Conditional("DEBUG")]
         void CheckInvariants(PoolState state)
         {
-            if (state.Total > _max)
-                throw new NpgsqlException($"Pool is over capacity (Total={state.Total}, Max={_max})");
+            if (state.Open > _max)
+                throw new NpgsqlException($"Pool is over capacity (Total={state.Open}, Max={_max})");
+            if (state.Open < 0)
+                throw new NpgsqlException("Open is negative");
             if (state.Idle < 0)
                 throw new NpgsqlException("Idle is negative");
             if (state.Busy < 0)
