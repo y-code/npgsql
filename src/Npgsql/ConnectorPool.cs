@@ -386,52 +386,45 @@ namespace Npgsql
 
             connector.Reset();
 
-            while (true)
+            // If there are any pending waiters we hand the connector off to them directly.
+            while (_waiting.TryDequeue(out var waitingOpenAttempt))
             {
-                // If there are any pending waiters we hand the connector off to them directly.
-                if (_waiting.TryDequeue(out var waitingOpenAttempt))
-                {
-                    var tcs = waitingOpenAttempt.TaskCompletionSource;
+                var tcs = waitingOpenAttempt.TaskCompletionSource;
 
-                    // We have a pending waiter. "Complete" it, handing off the connector.
-                    if (!tcs.TrySetResult(connector))
-                    {
-                        // If the open attempt timed out, the Task's state will be set to Canceled and our
-                        // TrySetResult fails. Try again.
-                        Debug.Assert(tcs.Task.IsCanceled);
-                        continue;
-                    }
-
+                // We have a pending waiter. "Complete" it, handing off the connector.
+                if (tcs.TrySetResult(connector))
                     return;
-                }
 
-                // Scenario: pre-empted release
-                // Right here between our check for waiters and our signalling decrement for storing
-                // a connector there could have been an awaiter enqueueing, we compensate at the end.
-
-                // If we're here, we put the connector back in the idle list
-                // We decrement Busy, any allocate that is racing us will not match Busy == _max
-                // and will not enqueue but try to get our connector.
-                Interlocked.Decrement(ref State.Busy);
-                connector.ReleaseTimestamp = DateTime.UtcNow;
-                _idle[connector.PoolIndex] = connector;
-                Interlocked.Increment(ref State.Idle);
-                CheckInvariants(State);
-
-                // Scenario: pre-empted release
-                // Unblock any potential waiter that raced us by handing it a null result.
-                // We try to complete exactly one waiter as long as there are any the queue.
-                while(_waiting.TryDequeue(out var racedWaiter))
-                {
-                    if (racedWaiter.TaskCompletionSource.TrySetResult(null))
-                        break;
-                }
-
-                // Scenario: pre-empted waiter
-                // Could have a pre-empted waiter, that didn't enqueue yet waking up right after
-                // our correcting dequeue, it will do a check itself after enqueue for Busy < _max.
-                return;
+                // If the open attempt timed out, the Task's state will be set to Canceled and our
+                // TrySetResult fails. Try again.
+                Debug.Assert(tcs.Task.IsCanceled);
             }
+
+            // Scenario: pre-empted release
+            // Right here between our check for waiters and our signalling decrement for storing
+            // a connector there could have been an awaiter enqueueing, we compensate at the end.
+
+            // If we're here, we put the connector back in the idle list
+            // We decrement Busy, any allocate that is racing us will not match Busy == _max
+            // and will not enqueue but try to get our connector.
+            Interlocked.Decrement(ref State.Busy);
+            connector.ReleaseTimestamp = DateTime.UtcNow;
+            _idle[connector.PoolIndex] = connector;
+            Interlocked.Increment(ref State.Idle);
+            CheckInvariants(State);
+
+            // Scenario: pre-empted release
+            // Unblock any potential waiter that raced us by handing it a null result.
+            // We try to complete exactly one waiter as long as there are any the queue.
+            while(_waiting.TryDequeue(out var racedWaiter))
+            {
+                if (racedWaiter.TaskCompletionSource.TrySetResult(null))
+                    break;
+            }
+
+            // Scenario: pre-empted waiter
+            // Could have a pre-empted waiter, that didn't enqueue yet waking up right after
+            // our correcting dequeue, it will do a check itself after enqueue for Busy < _max.
         }
 
         void CloseConnector(NpgsqlConnector connector, bool wasIdle)
