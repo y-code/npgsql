@@ -70,10 +70,7 @@ namespace Npgsql
             internal PoolState Copy() => new PoolState { All = Volatile.Read(ref All) };
 
             public override string ToString()
-            {
-                var state = Copy();
-                return $"[{state.Open} total, {state.Idle} idle, {state.Busy} busy]";
-            }
+                => $"[{Open} total, {Idle} idle, {Busy} busy]";
         }
 
         internal PoolState State;
