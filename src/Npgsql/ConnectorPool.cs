@@ -259,7 +259,7 @@ namespace Npgsql
 
                     // Pool is exhausted.
                     // Enqueue an allocate attempt into the waiting queue so that the next release will unblock us.
-                    var tcs = new TaskCompletionSource<NpgsqlConnector?>();
+                    var tcs = new TaskCompletionSource<NpgsqlConnector?>(TaskCreationOptions.RunContinuationsAsynchronously);
                     _waiting.Enqueue((tcs, async));
 
                     // Scenario: pre-empted waiter
@@ -357,10 +357,6 @@ namespace Npgsql
 
                     connector.Connection = conn;
 
-                    // Make sure we don't run user code inline.
-                    if (async)
-                        await Task.Yield();
-
                     return connector;
                 }
 
@@ -454,7 +450,7 @@ namespace Npgsql
 
                 // We don't need to interlock for clearing open as this slot isn't ever written to concurrently.
                 _open[connector.PoolIndex] = null;
-                
+
                 Interlocked.Decrement(ref State.Open);
                 CheckInvariants(State);
 
