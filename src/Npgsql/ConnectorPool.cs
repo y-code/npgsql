@@ -50,6 +50,7 @@ namespace Npgsql
         readonly int _min;
 
         readonly NpgsqlConnector?[] _idle;
+        readonly NpgsqlConnector?[] _open; // TODO could be a 'bitmap' whether the index has a connector or not
 
         readonly ConcurrentQueue<(TaskCompletionSource<NpgsqlConnector?> TaskCompletionSource, bool IsAsync)> _waiting;
 
@@ -116,6 +117,7 @@ namespace Npgsql
 
             _pruningInterval = TimeSpan.FromSeconds(Settings.ConnectionPruningInterval);
             _idle = new NpgsqlConnector[_max];
+            _open = new NpgsqlConnector[_max];
             _waiting = new ConcurrentQueue<(TaskCompletionSource<NpgsqlConnector?> TaskCompletionSource, bool IsAsync)>();
         }
 
@@ -213,6 +215,17 @@ namespace Npgsql
                         // We've managed to increase the open counter, open a physical connections.
                         connector = new NpgsqlConnector(conn) { ClearCounter = _clearCounter };
                         await connector.Open(timeout, async, cancellationToken);
+
+                        // We immediately store the connector as well, assigning it an index
+                        // that will be used during the lifetime of the connector for both _idle and _all.
+                        for (var i = 0; i < _open.Length; i++)
+                        {
+                            if (Interlocked.CompareExchange(ref _open[i], connector, null) == null)
+                            {
+                                connector.PoolIndex = i;
+                                break;
+                            }
+                        }
 
                         // Start the pruning timer if we're above MinPoolSize
                         if (_pruningTimer == null && openCount > _min)
@@ -408,42 +421,7 @@ namespace Npgsql
                 // and will not enqueue but try to get our connector.
                 Interlocked.Decrement(ref State.Busy);
                 connector.ReleaseTimestamp = DateTime.UtcNow;
-
-                // We start scanning for an empty slot in "random" places in the array, to avoid
-                // too much interlocked operations "contention" at the beginning.
-                var start = Thread.CurrentThread.ManagedThreadId % _max;
-
-                var sw = new SpinWait();
-                var success = false;
-                while (!success)
-                {
-                    for (var i = start; i < _idle.Length; i++)
-                    {
-                        if (Interlocked.CompareExchange(ref _idle[i], connector, null) == null)
-                        {
-                            Counters.NumberOfFreeConnections.Increment();
-                            success = true;
-                            break;
-                        }
-                    }
-
-                    if (!success)
-                    {
-                        for (var i = 0; i < start; i++)
-                        {
-                            if (Interlocked.CompareExchange(ref _idle[i], connector, null) == null)
-                            {
-                                Counters.NumberOfFreeConnections.Increment();
-                                success = true;
-                                break;
-                            }
-                        }
-
-                        sw.SpinOnce();
-                    }
-                }
-
-                // Finally increment idle after we stored the connector
+                _idle[connector.PoolIndex] = connector;
                 Interlocked.Increment(ref State.Idle);
                 CheckInvariants(State);
 
@@ -477,6 +455,9 @@ namespace Npgsql
                 else
                     Interlocked.Decrement(ref State.Busy);
 
+                // We don't need to interlock for clearing open as this slot isn't ever written to concurrently.
+                _open[connector.PoolIndex] = null;
+                
                 Interlocked.Decrement(ref State.Open);
                 CheckInvariants(State);
 
