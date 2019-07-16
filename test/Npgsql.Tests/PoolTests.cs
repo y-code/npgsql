@@ -378,7 +378,8 @@ namespace Npgsql.Tests
 
             var state = pool.State;
             Assert.That(state.Idle, Is.EqualTo(idle), $"Idle should be {idle} but is {state.Idle}");
-            Assert.That(state.Busy, Is.EqualTo(busy), $"Busy should be {busy} but is {state.Busy}");
+            var stateBusy = state.Open - state.Idle;
+            Assert.That(stateBusy, Is.EqualTo(busy), $"Busy should be {busy} but is {stateBusy}");
         }
     }
 }
