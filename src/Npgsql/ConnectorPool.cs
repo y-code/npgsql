@@ -125,7 +125,7 @@ namespace Npgsql
             // the idle list before updating Idle.
             // Loop until either State.Idle is 0 or you manage to remove a connector.
             connector = null;
-            var sw = new SpinWait();
+            var spinner = new SpinWait();
             var idle = _idle;
             while (Volatile.Read(ref State.Idle) > 0)
             {
@@ -143,7 +143,7 @@ namespace Npgsql
 
                 if (connector == null)
                 {
-                    sw.SpinOnce();
+                    spinner.SpinOnce();
                     continue;
                 }
 
@@ -191,11 +191,10 @@ namespace Npgsql
                     // Don't spin for this https://github.com/dotnet/coreclr/pull/21437
                     while (true)
                     {
-                        openCount = Volatile.Read(ref State.Open);
-                        if (Interlocked.CompareExchange(ref State.Open, openCount + 1, openCount) == openCount)
-                        {
-                            break;
-                        }
+                        var openCountPrev = Interlocked.CompareExchange(ref State.Open, openCount + 1, openCount);
+                        if (openCountPrev == openCount) break;
+
+                        openCount = openCountPrev;
                     }
 
                     try
@@ -413,7 +412,7 @@ namespace Npgsql
             // We try to complete exactly one waiter as long as there are any in the queue, if any came in at all.
             // The performance of trying this after each _idle release is fine as the queue is very uncontended.
             // In the .Net Core BCL, 3.0 as of writing, TryDequeue for the empty path is as fast as doing IsEmpty.
-            while(_waiting.TryDequeue(out var racedWaiter))
+            while (_waiting.TryDequeue(out var racedWaiter))
             {
                 if (racedWaiter.TaskCompletionSource.TrySetResult(null))
                     break;
