@@ -403,7 +403,8 @@ namespace Npgsql
             // and will not enqueue but try to get our connector.
             Interlocked.Increment(ref State.Idle);
             connector.ReleaseTimestamp = DateTime.UtcNow;
-            _idle[connector.PoolIndex] = connector;
+            // Prevent reordering wit ReleaseTimestamp
+            Volatile.Write(ref _idle[connector.PoolIndex], connector);
             CheckInvariants(State);
 
             // Scenario: pre-empted release
