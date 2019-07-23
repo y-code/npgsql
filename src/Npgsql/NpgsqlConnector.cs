@@ -197,7 +197,7 @@ namespace Npgsql
         /// <summary>
         /// If pooled, the pool index on which this connector will be returned to the pool.
         /// </summary>
-        internal int PoolIndex { get; set; }
+        internal int PoolIndex { get; set; } = int.MaxValue;
 
         internal int ClearCounter { get; set; }
 
