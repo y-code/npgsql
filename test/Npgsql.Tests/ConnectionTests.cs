@@ -1326,7 +1326,6 @@ namespace Npgsql.Tests
 
         #region Connection URI
 
-        [Category("ConnectionUri")]
         [Test]
         public void ConnectionUri()
         {
