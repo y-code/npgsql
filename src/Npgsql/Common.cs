@@ -14,7 +14,7 @@ namespace Npgsql
         BackendKeyData        = (byte)'K',
         BindComplete          = (byte)'2',
         CloseComplete         = (byte)'3',
-        CompletedResponse     = (byte)'C',
+        CommandComplete       = (byte)'C',
         CopyData              = (byte)'d',
         CopyDone              = (byte)'c',
         CopyBothResponse      = (byte)'W',
@@ -46,6 +46,7 @@ namespace Npgsql
         internal const byte Bind =      (byte)'B';
         internal const byte Close =     (byte)'C';
         internal const byte Query =     (byte)'Q';
+        internal const byte CopyData =  (byte)'d';
         internal const byte CopyDone =  (byte)'c';
         internal const byte CopyFail =  (byte)'f';
         internal const byte Terminate = (byte)'X';
@@ -64,6 +65,7 @@ namespace Npgsql
     public enum StatementType
     {
 #pragma warning disable 1591
+        Unknown,
         Select,
         Insert,
         Delete,

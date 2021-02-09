@@ -27,14 +27,14 @@ namespace NpgsqlTypes
 
         #region Constants
 
-        public static readonly NpgsqlDateTime Epoch = new NpgsqlDateTime(NpgsqlDate.Epoch);
-        public static readonly NpgsqlDateTime Era = new NpgsqlDateTime(NpgsqlDate.Era);
+        public static readonly NpgsqlDateTime Epoch = new(NpgsqlDate.Epoch);
+        public static readonly NpgsqlDateTime Era = new(NpgsqlDate.Era);
 
         public static readonly NpgsqlDateTime Infinity =
-            new NpgsqlDateTime(InternalType.Infinity, NpgsqlDate.Era, TimeSpan.Zero);
+            new(InternalType.Infinity, NpgsqlDate.Era, TimeSpan.Zero);
 
         public static readonly NpgsqlDateTime NegativeInfinity =
-            new NpgsqlDateTime(InternalType.NegativeInfinity, NpgsqlDate.Era, TimeSpan.Zero);
+            new(InternalType.NegativeInfinity, NpgsqlDate.Era, TimeSpan.Zero);
 
         // 9999-12-31
         const int MaxDateTimeDay = 3652058;
@@ -195,7 +195,7 @@ namespace NpgsqlTypes
             }
         }
 
-        public static NpgsqlDateTime Now => new NpgsqlDateTime(DateTime.Now);
+        public static NpgsqlDateTime Now => new(DateTime.Now);
 
         #endregion
 
@@ -308,14 +308,14 @@ namespace NpgsqlTypes
         #region Arithmetic
 
         /// <summary>
-        /// Returns a new <see cref="NpgsqlDateTime"/> that adds the value of the specified TimeSpan to the value of this instance.
+        /// Returns a new <see cref="NpgsqlDateTime"/> that adds the value of the specified <see cref="NpgsqlTimeSpan"/> to the value of this instance.
         /// </summary>
-        /// <param name="value">A positive or negative time interval.</param>
+        /// <param name="value">An NpgsqlTimeSpan interval.</param>
         /// <returns>An object whose value is the sum of the date and time represented by this instance and the time interval represented by value.</returns>
-        public NpgsqlDateTime Add(NpgsqlTimeSpan value) { return AddTicks(value.Ticks); }
+        public NpgsqlDateTime Add(in NpgsqlTimeSpan value) => AddTicks(value.UnjustifyInterval().TotalTicks);
 
         /// <summary>
-        /// Returns a new <see cref="NpgsqlDateTime"/> that adds the value of the specified <see cref="NpgsqlTimeSpan"/> to the value of this instance.
+        /// Returns a new <see cref="NpgsqlDateTime"/> that adds the value of the specified TimeSpan to the value of this instance.
         /// </summary>
         /// <param name="value">A positive or negative time interval.</param>
         /// <returns>An object whose value is the sum of the date and time represented by this instance and the time interval represented by value.</returns>
@@ -395,7 +395,7 @@ namespace NpgsqlTypes
                 _                             => new NpgsqlDateTime(Ticks + value, Kind),
             };
 
-        public NpgsqlDateTime Subtract(NpgsqlTimeSpan interval) =>  Add(-interval);
+        public NpgsqlDateTime Subtract(in NpgsqlTimeSpan interval) =>  Add(-interval);
 
         public NpgsqlTimeSpan Subtract(NpgsqlDateTime timestamp)
         {
@@ -443,7 +443,7 @@ namespace NpgsqlTypes
         /// <param name="dateTime">A <see cref="DateTime"/></param>
         /// <returns>An equivalent <see cref="NpgsqlDateTime"/>.</returns>
         public static implicit operator NpgsqlDateTime(DateTime dateTime) => ToNpgsqlDateTime(dateTime);
-        public static NpgsqlDateTime ToNpgsqlDateTime(DateTime dateTime) => new NpgsqlDateTime(dateTime);
+        public static NpgsqlDateTime ToNpgsqlDateTime(DateTime dateTime) => new(dateTime);
 
         /// <summary>
         /// Explicit cast of an <see cref="NpgsqlDateTime"/> to a <see cref="DateTime"/>.

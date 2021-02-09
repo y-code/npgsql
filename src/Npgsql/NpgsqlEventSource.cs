@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using System.Diagnostics.Tracing;
 using System.Runtime.CompilerServices;
@@ -7,14 +9,14 @@ namespace Npgsql
 {
     sealed class NpgsqlEventSource : EventSource
     {
-        public static readonly NpgsqlEventSource Log = new NpgsqlEventSource();
+        public static readonly NpgsqlEventSource Log = new();
 
         const string EventSourceName = "Npgsql";
 
         internal const int CommandStartId = 3;
         internal const int CommandStopId = 4;
 
-#if !NET461 && !NETSTANDARD2_0
+#if !NETSTANDARD2_0
         IncrementingPollingCounter? _bytesWrittenPerSecondCounter;
         IncrementingPollingCounter? _bytesReadPerSecondCounter;
 
@@ -27,6 +29,11 @@ namespace Npgsql
         PollingCounter? _poolsCounter;
         PollingCounter? _idleConnectionsCounter;
         PollingCounter? _busyConnectionsCounter;
+
+        PollingCounter? _multiplexingAverageCommandsPerBatchCounter;
+        PollingCounter? _multiplexingAverageWaitsPerBatchCounter;
+        PollingCounter? _multiplexingAverageWriteTimePerBatchCounter;
+
 #endif
         long _bytesWritten;
         long _bytesRead;
@@ -36,7 +43,13 @@ namespace Npgsql
         long _currentCommands;
         long _failedCommands;
 
-        int _pools;
+        readonly object _poolsLock = new();
+        readonly HashSet<ConnectorPool> _pools = new();
+
+        long _multiplexingBatchesSent;
+        long _multiplexingCommandsSent;
+        long _multiplexingWaits;
+        long _multiplexingTicksWritten;
 
         internal NpgsqlEventSource() : base(EventSourceName) {}
 
@@ -50,58 +63,78 @@ namespace Npgsql
         internal void BytesWritten(long bytesWritten) => Interlocked.Add(ref _bytesWritten, bytesWritten);
         internal void BytesRead(long bytesRead) => Interlocked.Add(ref _bytesRead, bytesRead);
 
-        [Event(CommandStartId, Level = EventLevel.Informational)]
         public void CommandStart(string sql)
         {
             Interlocked.Increment(ref _totalCommands);
             Interlocked.Increment(ref _currentCommands);
-            WriteEvent(CommandStartId, sql);
+            NpgsqlSqlEventSource.Log.CommandStart(sql);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        [Event(CommandStopId, Level = EventLevel.Informational)]
         public void CommandStop()
         {
             Interlocked.Decrement(ref _currentCommands);
-            WriteEvent(CommandStopId);
+            NpgsqlSqlEventSource.Log.CommandStop();
         }
 
         internal void CommandStartPrepared() => Interlocked.Increment(ref _totalPreparedCommands);
 
         internal void CommandFailed() => Interlocked.Increment(ref _failedCommands);
 
-        internal void PoolCreated() => Interlocked.Increment(ref _pools);
-
-#if !NET461 && !NETSTANDARD2_0
-        static int GetIdleConnections()
+        internal void PoolCreated(ConnectorPool pool)
         {
-            // Note: there's no attempt here to be coherent in terms of race conditions, especially not with regards
-            // to different counters. So idle and busy and be unsynchronized, as they're not polled together.
-            var sum = 0;
-            foreach (var kv in PoolManager.Pools)
+            lock (_poolsLock)
             {
-                var pool = kv.Pool;
-                if (pool == null)
-                    return sum;
-                sum += pool.State.Idle;
+                _pools.Add(pool);
             }
-            return sum;
         }
 
-        static int GetBusyConnections()
+        internal void MultiplexingBatchSent(int numCommands, int waits, Stopwatch stopwatch)
+        {
+            // TODO: CAS loop instead of 4 separate interlocked operations?
+            Interlocked.Increment(ref _multiplexingBatchesSent);
+            Interlocked.Add(ref _multiplexingCommandsSent, numCommands);
+            Interlocked.Add(ref _multiplexingWaits, waits);
+            Interlocked.Add(ref _multiplexingTicksWritten, stopwatch.ElapsedTicks);
+        }
+
+#if !NETSTANDARD2_0
+        int GetIdleConnections()
         {
             // Note: there's no attempt here to be coherent in terms of race conditions, especially not with regards
             // to different counters. So idle and busy and be unsynchronized, as they're not polled together.
-            var sum = 0;
-            foreach (var kv in PoolManager.Pools)
+            lock (_poolsLock)
             {
-                var pool = kv.Pool;
-                if (pool == null)
-                    return sum;
-                var (_, _, busy) = pool.State;
-                sum += busy;
+                var sum = 0;
+                foreach (var pool in _pools)
+                {
+                    sum += pool.Statistics.Idle;
+                }
+                return sum;
             }
-            return sum;
+        }
+
+        int GetBusyConnections()
+        {
+            // Note: there's no attempt here to be coherent in terms of race conditions, especially not with regards
+            // to different counters. So idle and busy and be unsynchronized, as they're not polled together.
+            lock (_poolsLock)
+            {
+                var sum = 0;
+                foreach (var pool in _pools)
+                {
+                    sum += pool.Statistics.Busy;
+                }
+                return sum;
+            }
+        }
+
+        int GetPoolsCount()
+        {
+            lock (_poolsLock)
+            {
+                return _pools.Count;
+            }
         }
 
         protected override void OnEventCommand(EventCommandEventArgs command)
@@ -114,51 +147,49 @@ namespace Npgsql
                 // overhead by at all times even when counters aren't enabled.
                 // On disable, PollingCounters will stop polling for values so it should be fine to leave them around.
 
-                _bytesWrittenPerSecondCounter = new IncrementingPollingCounter("bytes-written-per-second", this, () => _bytesWritten)
+                _bytesWrittenPerSecondCounter = new IncrementingPollingCounter("bytes-written-per-second", this, () => Interlocked.Read(ref _bytesWritten))
                 {
                     DisplayName = "Bytes Written",
                     DisplayRateTimeScale = TimeSpan.FromSeconds(1)
                 };
 
-                _bytesReadPerSecondCounter = new IncrementingPollingCounter("bytes-read-per-second", this, () => _bytesRead)
+                _bytesReadPerSecondCounter = new IncrementingPollingCounter("bytes-read-per-second", this, () => Interlocked.Read(ref _bytesRead))
                 {
                     DisplayName = "Bytes Read",
                     DisplayRateTimeScale = TimeSpan.FromSeconds(1)
                 };
 
-                _commandsPerSecondCounter = new IncrementingPollingCounter("commands-per-second", this, () => _totalCommands)
+                _commandsPerSecondCounter = new IncrementingPollingCounter("commands-per-second", this, () => Interlocked.Read(ref _totalCommands))
                 {
                     DisplayName = "Command Rate",
                     DisplayRateTimeScale = TimeSpan.FromSeconds(1)
                 };
 
-                _totalCommandsCounter = new PollingCounter("total-commands", this, () => _totalCommands)
+                _totalCommandsCounter = new PollingCounter("total-commands", this, () => Interlocked.Read(ref _totalCommands))
                 {
                     DisplayName = "Total Commands",
                 };
 
-                _currentCommandsCounter = new PollingCounter("current-commands", this, () => _currentCommands)
+                _currentCommandsCounter = new PollingCounter("current-commands", this, () => Interlocked.Read(ref _currentCommands))
                 {
                     DisplayName = "Current Commands"
                 };
 
-                _failedCommandsCounter = new PollingCounter("failed-commands", this, () => _failedCommands)
+                _failedCommandsCounter = new PollingCounter("failed-commands", this, () => Interlocked.Read(ref _failedCommands))
                 {
                     DisplayName = "Failed Commands"
                 };
 
-//                _preparedCommandsRatioCounter = new PollingCounter("prepared-commands-ratio", this, () => (double)_totalPreparedCommands / (double)_totalCommands)
-                _preparedCommandsRatioCounter = new PollingCounter("prepared-commands-ratio", this, () =>
-                {
-                    Console.WriteLine($"{(double)_totalPreparedCommands} / {(double)_totalCommands}");
-                    return (double)_totalPreparedCommands / (double)_totalCommands;
-                })
+                _preparedCommandsRatioCounter = new PollingCounter(
+                    "prepared-commands-ratio",
+                    this,
+                    () => (double)Interlocked.Read(ref _totalPreparedCommands) / Interlocked.Read(ref _totalCommands))
                 {
                     DisplayName = "Prepared Commands Ratio",
                     DisplayUnits = "%"
                 };
 
-                _poolsCounter = new PollingCounter("connection-pools", this, () => _pools)
+                _poolsCounter = new PollingCounter("connection-pools", this, () => GetPoolsCount())
                 {
                     DisplayName = "Connection Pools"
                 };
@@ -171,6 +202,22 @@ namespace Npgsql
                 _busyConnectionsCounter = new PollingCounter("busy-connections", this, () => GetBusyConnections())
                 {
                     DisplayName = "Busy Connections"
+                };
+
+                _multiplexingAverageCommandsPerBatchCounter = new PollingCounter("multiplexing-average-commands-per-batch", this, () => (double)Interlocked.Read(ref _multiplexingCommandsSent) / Interlocked.Read(ref _multiplexingBatchesSent))
+                {
+                    DisplayName = "Average commands per multiplexing batch"
+                };
+
+                _multiplexingAverageWaitsPerBatchCounter = new PollingCounter("multiplexing-average-waits-per-batch", this, () => (double)Interlocked.Read(ref _multiplexingWaits) / Interlocked.Read(ref _multiplexingBatchesSent))
+                {
+                    DisplayName = "Average waits per multiplexing batch"
+                };
+
+                _multiplexingAverageWriteTimePerBatchCounter = new PollingCounter("multiplexing-average-write-time-per-batch", this, () => (double)Interlocked.Read(ref _multiplexingTicksWritten) / Interlocked.Read(ref _multiplexingBatchesSent) / 1000)
+                {
+                    DisplayName = "Average write time per multiplexing batch (us)",
+                    DisplayUnits = "us"
                 };
             }
         }

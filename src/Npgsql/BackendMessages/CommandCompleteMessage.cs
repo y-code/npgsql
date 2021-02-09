@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using Npgsql.Internal;
 
 namespace Npgsql.BackendMessages
 {
@@ -103,6 +104,6 @@ namespace Npgsql.BackendMessages
             return result;
         }
 
-        public BackendMessageCode Code => BackendMessageCode.CompletedResponse;
+        public BackendMessageCode Code => BackendMessageCode.CommandComplete;
     }
 }

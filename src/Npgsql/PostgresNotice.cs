@@ -1,6 +1,6 @@
 ﻿using System;
-using JetBrains.Annotations;
 using Npgsql.BackendMessages;
+using Npgsql.Internal;
 
 namespace Npgsql
 {
@@ -10,7 +10,7 @@ namespace Npgsql
     /// initiates a "fast" database shutdown).
     /// </summary>
     /// <remarks>
-    /// http://www.postgresql.org/docs/current/static/protocol-flow.html#PROTOCOL-ASYNC
+    /// https://www.postgresql.org/docs/current/static/protocol-flow.html#PROTOCOL-ASYNC
     /// </remarks>
     public sealed class PostgresNotice
     {
@@ -20,14 +20,12 @@ namespace Npgsql
         /// Severity of the error or notice.
         /// Always present.
         /// </summary>
-        [PublicAPI]
         public string Severity { get; set; }
 
         /// <summary>
         /// Severity of the error or notice, not localized.
         /// Always present since PostgreSQL 9.6.
         /// </summary>
-        [PublicAPI]
         public string InvariantSeverity { get; }
 
         /// <summary>
@@ -35,9 +33,8 @@ namespace Npgsql
         /// </summary>
         /// <remarks>
         /// Always present.
-        /// See http://www.postgresql.org/docs/current/static/errcodes-appendix.html
+        /// See https://www.postgresql.org/docs/current/static/errcodes-appendix.html
         /// </remarks>
-        [PublicAPI]
         public string SqlState { get; set; }
 
         /// <summary>
@@ -45,9 +42,9 @@ namespace Npgsql
         /// </summary>
         /// <remarks>
         /// Always present.
-        /// See http://www.postgresql.org/docs/current/static/errcodes-appendix.html
+        /// See https://www.postgresql.org/docs/current/static/errcodes-appendix.html
         /// </remarks>
-        [PublicAPI, Obsolete("Use SqlState instead")]
+        [Obsolete("Use SqlState instead")]
         public string Code => SqlState;
 
         /// <summary>
@@ -56,14 +53,12 @@ namespace Npgsql
         /// <remarks>
         /// Always present.
         /// </remarks>
-        [PublicAPI]
         public string MessageText { get; set; }
 
         /// <summary>
         /// An optional secondary error message carrying more detail about the problem.
         /// May run to multiple lines.
         /// </summary>
-        [PublicAPI]
         public string? Detail { get; set; }
 
         /// <summary>
@@ -71,7 +66,6 @@ namespace Npgsql
         /// This is intended to differ from Detail in that it offers advice (potentially inappropriate) rather than hard facts.
         /// May run to multiple lines.
         /// </summary>
-        [PublicAPI]
         public string? Hint { get; set; }
 
         /// <summary>
@@ -79,7 +73,6 @@ namespace Npgsql
         /// The first character has index 1, and positions are measured in characters not bytes.
         /// 0 means not provided.
         /// </summary>
-        [PublicAPI]
         public int Position { get; set; }
 
         /// <summary>
@@ -87,14 +80,12 @@ namespace Npgsql
         /// The <see cref="InternalQuery" /> field will always appear when this field appears.
         /// 0 means not provided.
         /// </summary>
-        [PublicAPI]
         public int InternalPosition { get; set; }
 
         /// <summary>
         /// The text of a failed internally-generated command.
         /// This could be, for example, a SQL query issued by a PL/pgSQL function.
         /// </summary>
-        [PublicAPI]
         public string? InternalQuery { get; set; }
 
         /// <summary>
@@ -102,14 +93,12 @@ namespace Npgsql
         /// Presently this includes a call stack traceback of active PL functions.
         /// The trace is one entry per line, most recent first.
         /// </summary>
-        [PublicAPI]
         public string? Where { get; set; }
 
         /// <summary>
         /// If the error was associated with a specific database object, the name of the schema containing that object, if any.
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? SchemaName { get; set; }
 
         /// <summary>
@@ -117,7 +106,6 @@ namespace Npgsql
         /// (Refer to the schema name field for the name of the table's schema.)
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? TableName { get; set; }
 
         /// <summary>
@@ -125,7 +113,6 @@ namespace Npgsql
         /// (Refer to the schema and table name fields to identify the table.)
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? ColumnName { get; set; }
 
         /// <summary>
@@ -133,7 +120,6 @@ namespace Npgsql
         /// (Refer to the schema name field for the name of the data type's schema.)
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? DataTypeName { get; set; }
 
         /// <summary>
@@ -142,26 +128,22 @@ namespace Npgsql
         /// (For this purpose, indexes are treated as constraints, even if they weren't created with constraint syntax.)
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? ConstraintName { get; set; }
 
         /// <summary>
         /// The file name of the source-code location where the error was reported.
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? File { get; set; }
 
         /// <summary>
         /// The line number of the source-code location where the error was reported.
         /// </summary>
-        [PublicAPI]
         public string? Line { get; set; }
 
         /// <summary>
         /// The name of the source-code routine reporting the error.
         /// </summary>
-        [PublicAPI]
         public string? Routine { get; set; }
 
         #endregion
@@ -169,47 +151,49 @@ namespace Npgsql
         /// <summary>
         /// Creates a new instance.
         /// </summary>
-        /// <remarks>
-        /// Exists for backwards compat with 4.0, has been removed for 5.0.
-        /// </remarks>
-        [Obsolete]
-        public PostgresNotice() : this(string.Empty, string.Empty, string.Empty, string.Empty) {}
+        public PostgresNotice(string severity, string invariantSeverity, string sqlState, string messageText)
+            : this(messageText, severity, invariantSeverity, sqlState, detail: null) {}
 
         /// <summary>
         /// Creates a new instance.
         /// </summary>
-        public PostgresNotice(string severity, string invariantSeverity, string sqlState, string messageText)
+        public PostgresNotice(
+            string messageText, string severity, string invariantSeverity, string sqlState,
+            string? detail = null, string? hint = null, int position = 0, int internalPosition = 0,
+            string? internalQuery = null, string? where = null, string? schemaName = null, string? tableName = null,
+            string? columnName = null, string? dataTypeName = null, string? constraintName = null, string? file = null,
+            string? line = null, string? routine = null)
         {
+            MessageText = messageText;
             Severity = severity;
             InvariantSeverity = invariantSeverity;
             SqlState = sqlState;
-            MessageText = messageText;
+
+            Detail = detail;
+            Hint = hint;
+            Position = position;
+            InternalPosition = internalPosition;
+            InternalQuery = internalQuery;
+            Where = where;
+            SchemaName = schemaName;
+            TableName = tableName;
+            ColumnName = columnName;
+            DataTypeName = dataTypeName;
+            ConstraintName = constraintName;
+            File = file;
+            Line = line;
+            Routine = routine;
         }
 
         PostgresNotice(ErrorOrNoticeMessage msg)
-        {
-            Severity = msg.Severity;
-            InvariantSeverity = msg.InvariantSeverity;
-            SqlState = msg.Code;
-            MessageText = msg.Message;
-            Detail = msg.Detail;
-            Hint = msg.Hint;
-            Position = msg.Position;
-            InternalPosition = msg.InternalPosition;
-            InternalQuery = msg.InternalQuery;
-            Where = msg.Where;
-            SchemaName = msg.SchemaName;
-            TableName = msg.TableName;
-            ColumnName = msg.ColumnName;
-            DataTypeName = msg.DataTypeName;
-            ConstraintName = msg.ConstraintName;
-            File = msg.File;
-            Line = msg.Line;
-            Routine = msg.Routine;
-        }
+            : this(
+                msg.Message, msg.Severity, msg.InvariantSeverity, msg.SqlState,
+                msg.Detail, msg.Hint, msg.Position, msg.InternalPosition, msg.InternalQuery,
+                msg.Where, msg.SchemaName, msg.TableName, msg.ColumnName, msg.DataTypeName,
+                msg.ConstraintName, msg.File, msg.Line, msg.Routine) {}
 
-        internal static PostgresNotice Load(NpgsqlReadBuffer buf)
-            => new PostgresNotice(ErrorOrNoticeMessage.Load(buf));
+        internal static PostgresNotice Load(NpgsqlReadBuffer buf, bool includeDetail)
+            => new(ErrorOrNoticeMessage.Load(buf, includeDetail));
     }
 
     /// <summary>

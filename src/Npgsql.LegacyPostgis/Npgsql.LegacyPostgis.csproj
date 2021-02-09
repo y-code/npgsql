@@ -3,9 +3,17 @@
     <Authors>Shay Rojansky</Authors>
     <Description>PostGIS plugin for Npgsql, allowing mapping of PostGIS types to the legacy types (e.g. PostgisPoint).</Description>
     <PackageTags>npgsql postgresql postgres postgis spatial geometry geography ado ado.net database sql</PackageTags>
-    <TargetFrameworks>net461;netstandard2.0</TargetFrameworks>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <TargetFramework Condition="'$(DeveloperBuild)' == 'True'">net5.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\Npgsql\Npgsql.csproj" />
+    <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" PrivateAssets="All" />
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Npgsql\Npgsql.csproj" />
+    <ProjectReference Include="../Npgsql.SourceGenerators/Npgsql.SourceGenerators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
 </Project>

@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -7,6 +8,9 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reflection;
+using System.Text;
+using Npgsql.Internal;
+using Npgsql.Replication;
 
 namespace Npgsql
 {
@@ -39,7 +43,12 @@ namespace Npgsql
         /// </summary>
         string? _dataSourceCached;
 
-        internal string DataSourceCached => _dataSourceCached ??= $"tcp://{_host}:{_port}";
+        internal string DataSourceCached
+            => _dataSourceCached ??= _host is null
+                ? string.Empty
+                : Path.IsPathRooted(_host)
+                    ? Path.Combine(_host, $".s.PGSQL.{_port}")
+                    : $"tcp://{_host}:{_port}";
 
         #endregion
 
@@ -59,7 +68,7 @@ namespace Npgsql
         /// <summary>
         /// Initializes a new instance of the NpgsqlConnectionStringBuilder class and sets its <see cref="DbConnectionStringBuilder.ConnectionString"/>.
         /// </summary>
-        public NpgsqlConnectionStringBuilder(string connectionString)
+        public NpgsqlConnectionStringBuilder(string? connectionString)
         {
             Init();
             ConnectionString = connectionString;
@@ -82,7 +91,7 @@ namespace Npgsql
         static NpgsqlConnectionStringBuilder()
         {
             var properties = typeof(NpgsqlConnectionStringBuilder)
-                .GetProperties()
+                .GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
                 .Where(p => p.GetCustomAttribute<NpgsqlConnectionStringPropertyAttribute>() != null)
                 .ToArray();
 
@@ -126,9 +135,8 @@ namespace Npgsql
         /// </summary>
         /// <param name="keyword">The key of the item to get or set.</param>
         /// <returns>The value associated with the specified key.</returns>
-#nullable disable
+        [AllowNull]
         public override object this[string keyword]
-#nullable restore
         {
             get
             {
@@ -138,7 +146,7 @@ namespace Npgsql
             }
             set
             {
-                if (value == null)
+                if (value is null)
                 {
                     Remove(keyword);
                     return;
@@ -171,6 +179,9 @@ namespace Npgsql
         /// <param name="item">The key-value pair to be added.</param>
         public void Add(KeyValuePair<string, object?> item)
             => this[item.Key] = item.Value!;
+
+        void IDictionary<string, object?>.Add(string keyword, object? value)
+            => this[keyword] = value;
 
         /// <summary>
         /// Removes the entry with the specified key from the DbConnectionStringBuilder instance.
@@ -551,6 +562,42 @@ namespace Npgsql
         string? _clientCertificate;
 
         /// <summary>
+        /// Key for a client certificate to be sent to the server.
+        /// </summary>
+        [Category("Security")]
+        [Description("Key for a client certificate to be sent to the server.")]
+        [DisplayName("Client Certificate Key")]
+        [NpgsqlConnectionStringProperty]
+        public string? ClientCertificateKey
+        {
+            get => _clientCertificateKey;
+            set
+            {
+                _clientCertificateKey = value;
+                SetValue(nameof(ClientCertificateKey), value);
+            }
+        }
+        string? _clientCertificateKey;
+
+        /// <summary>
+        /// Location of a CA certificate used to validate the server certificate.
+        /// </summary>
+        [Category("Security")]
+        [Description("Location of a CA certificate used to validate the server certificate.")]
+        [DisplayName("Root Certificate")]
+        [NpgsqlConnectionStringProperty]
+        public string? RootCertificate
+        {
+            get => _rootCertificate;
+            set
+            {
+                _rootCertificate = value;
+                SetValue(nameof(RootCertificate), value);
+            }
+        }
+        string? _rootCertificate;
+
+        /// <summary>
         /// Whether to check the certificate revocation list during authentication.
         /// False by default.
         /// </summary>
@@ -646,6 +693,46 @@ namespace Npgsql
         }
         bool _persistSecurityInfo;
 
+        /// <summary>
+        /// When enabled, parameter values are logged when commands are executed. Defaults to false.
+        /// </summary>
+        [Category("Security")]
+        [Description("When enabled, parameter values are logged when commands are executed. Defaults to false.")]
+        [DisplayName("Log Parameters")]
+        [NpgsqlConnectionStringProperty]
+        public bool LogParameters
+        {
+            get => _logParameters;
+            set
+            {
+                _logParameters = value;
+                SetValue(nameof(LogParameters), value);
+            }
+        }
+        bool _logParameters;
+
+        internal const string IncludeExceptionDetailDisplayName = "Include Error Detail";
+
+        /// <summary>
+        /// When enabled, PostgreSQL error details are included on <see cref="PostgresException.Detail" /> and
+        /// <see cref="PostgresNotice.Detail" />. These can contain sensitive data.
+        /// </summary>
+        [Category("Security")]
+        [Description("When enabled, PostgreSQL error and notice details are included on PostgresException.Detail and PostgresNotice.Detail. These can contain sensitive data.")]
+        [DisplayName(IncludeExceptionDetailDisplayName)]
+        [NpgsqlConnectionStringProperty]
+        public bool IncludeErrorDetails
+        {
+            get => _includeErrorDetails;
+            set
+            {
+                _includeErrorDetails = value;
+                SetValue(nameof(IncludeErrorDetails), value);
+            }
+        }
+        bool _includeErrorDetails;
+
+
         #endregion
 
         #region Properties - Pooling
@@ -682,8 +769,8 @@ namespace Npgsql
             get => _minPoolSize;
             set
             {
-                if (value < 0 || value > ConnectorPool.PoolSizeLimit)
-                    throw new ArgumentOutOfRangeException(nameof(value), value, "MinPoolSize must be between 0 and " + ConnectorPool.PoolSizeLimit);
+                if (value < 0)
+                    throw new ArgumentOutOfRangeException(nameof(value), value, "MinPoolSize can't be negative");
 
                 _minPoolSize = value;
                 SetValue(nameof(MinPoolSize), value);
@@ -704,8 +791,8 @@ namespace Npgsql
             get => _maxPoolSize;
             set
             {
-                if (value < 0 || value > ConnectorPool.PoolSizeLimit)
-                    throw new ArgumentOutOfRangeException(nameof(value), value, "MaxPoolSize must be between 0 and " + ConnectorPool.PoolSizeLimit);
+                if (value < 0)
+                    throw new ArgumentOutOfRangeException(nameof(value), value, "MaxPoolSize can't be negative");
 
                 _maxPoolSize = value;
                 SetValue(nameof(MaxPoolSize), value);
@@ -754,6 +841,28 @@ namespace Npgsql
             }
         }
         int _connectionPruningInterval;
+
+        /// <summary>
+        /// The total maximum lifetime of connections (in seconds). Connections which have exceeded this value will be
+        /// destroyed instead of returned from the pool. This is useful in clustered configurations to force load
+        /// balancing between a running server and a server just brought online.
+        /// </summary>
+        /// <value>The time (in seconds) to wait, or 0 to to make connections last indefinitely (the default).</value>
+        [Category("Pooling")]
+        [Description("The total maximum lifetime of connections (in seconds).")]
+        [DisplayName("Connection Lifetime")]
+        [NpgsqlConnectionStringProperty("Load Balance Timeout")]
+        [DefaultValue(0)]
+        public int ConnectionLifetime
+        {
+            get => _connectionLifetime;
+            set
+            {
+                _connectionLifetime = value;
+                SetValue(nameof(ConnectionLifetime), value);
+            }
+        }
+        int _connectionLifetime;
 
         #endregion
 
@@ -830,6 +939,29 @@ namespace Npgsql
         }
         int _internalCommandTimeout;
 
+        /// <summary>
+        /// The time to wait (in milliseconds) while trying to read a response for a cancellation request for a timed out or cancelled query, before terminating the attempt and generating an error.
+        /// Defaults to 2000 milliseconds.
+        /// </summary>
+        [Category("Timeouts")]
+        [Description("After Command Timeout is reached (or user supplied cancellation token is cancelled) and command cancellation is attempted, Npgsql waits for this additional timeout (in milliseconds) before breaking the connection. Defaults to 2000, set to zero for infinity.")]
+        [DisplayName("Cancellation Timeout")]
+        [NpgsqlConnectionStringProperty]
+        [DefaultValue(2000)]
+        public int CancellationTimeout
+        {
+            get => _cancellationTimeout;
+            set
+            {
+                if (value < 0)
+                    throw new ArgumentOutOfRangeException(nameof(value), value, $"{nameof(CancellationTimeout)} can't be negative");
+
+                _cancellationTimeout = value;
+                SetValue(nameof(CancellationTimeout), value);
+            }
+        }
+        int _cancellationTimeout;
+
         #endregion
 
         #region Properties - Entity Framework
@@ -839,7 +971,7 @@ namespace Npgsql
         /// PostgreSQL defaults to "template1".
         /// </summary>
         /// <remarks>
-        /// http://www.postgresql.org/docs/current/static/manage-ag-templatedbs.html
+        /// https://www.postgresql.org/docs/current/static/manage-ag-templatedbs.html
         /// </remarks>
         [Category("Entity Framework")]
         [Description("The database template to specify when creating a database in Entity Framework. If not specified, PostgreSQL defaults to \"template1\".")]
@@ -923,10 +1055,10 @@ namespace Npgsql
         /// <summary>
         /// The number of seconds of connection inactivity before a TCP keepalive query is sent.
         /// Use of this option is discouraged, use <see cref="KeepAlive"/> instead if possible.
-        /// Set to 0 (the default) to disable. Supported only on Windows.
+        /// Set to 0 (the default) to disable.
         /// </summary>
         [Category("Advanced")]
-        [Description("The number of milliseconds of connection inactivity before a TCP keepalive query is sent.")]
+        [Description("The number of seconds of connection inactivity before a TCP keepalive query is sent.")]
         [DisplayName("TCP Keepalive Time")]
         [NpgsqlConnectionStringProperty]
         public int TcpKeepAliveTime
@@ -944,12 +1076,11 @@ namespace Npgsql
         int _tcpKeepAliveTime;
 
         /// <summary>
-        /// The interval, in milliseconds, between when successive keep-alive packets are sent if no acknowledgement is received.
+        /// The interval, in seconds, between when successive keep-alive packets are sent if no acknowledgement is received.
         /// Defaults to the value of <see cref="TcpKeepAliveTime"/>. <see cref="TcpKeepAliveTime"/> must be non-zero as well.
-        /// Supported only on Windows.
         /// </summary>
         [Category("Advanced")]
-        [Description("The interval, in milliseconds, between when successive keep-alive packets are sent if no acknowledgement is received.")]
+        [Description("The interval, in seconds, between when successive keep-alive packets are sent if no acknowledgement is received.")]
         [DisplayName("TCP Keepalive Interval")]
         [NpgsqlConnectionStringProperty]
         public int TcpKeepAliveInterval
@@ -1087,24 +1218,6 @@ namespace Npgsql
         int _autoPrepareMinUsages;
 
         /// <summary>
-        /// Writes connection performance information to performance counters.
-        /// </summary>
-        [Category("Advanced")]
-        [Description("Writes connection performance information to performance counters.")]
-        [DisplayName("Use Perf Counters")]
-        [NpgsqlConnectionStringProperty]
-        public bool UsePerfCounters
-        {
-            get => _usePerfCounters;
-            set
-            {
-                _usePerfCounters = value;
-                SetValue(nameof(UsePerfCounters), value);
-            }
-        }
-        bool _usePerfCounters;
-
-        /// <summary>
         /// If set to true, a pool connection's state won't be reset when it is closed (improves performance).
         /// Do not specify this unless you know what you're doing.
         /// </summary>
@@ -1140,6 +1253,132 @@ namespace Npgsql
             }
         }
         bool _loadTableComposites;
+
+        /// <summary>
+        /// Set the replication mode of the connection
+        /// </summary>
+        /// <remarks>
+        /// This property and its corresponding enum are intentionally kept internal as they
+        /// should not be set by users or even be visible in their connection strings.
+        /// Replication connections are a special kind of connection that is encapsulated in
+        /// <see cref="PhysicalReplicationConnection"/>
+        /// and <see cref="LogicalReplicationConnection"/>.
+        /// </remarks>
+        [NpgsqlConnectionStringProperty]
+        [DisplayName("Replication Mode")]
+        internal ReplicationMode ReplicationMode
+        {
+            get => _replicationMode;
+            set
+            {
+                _replicationMode = value;
+                SetValue(nameof(ReplicationMode), value);
+            }
+        }
+        ReplicationMode _replicationMode;
+
+        /// <summary>
+        /// Set PostgreSQL configuration parameter default values for the connection.
+        /// </summary>
+        [Category("Advanced")]
+        [Description("Set PostgreSQL configuration parameter default values for the connection.")]
+        [DisplayName("Options")]
+        [NpgsqlConnectionStringProperty]
+        public string? Options
+        {
+            get => _options;
+            set
+            {
+                _options = value;
+                SetValue(nameof(Options), value);
+            }
+        }
+
+        string? _options;
+
+        /// <summary>
+        /// Configure the way arrays of value types are returned when requested as object instances.
+        /// </summary>
+        [Category("Advanced")]
+        [Description("Configure the way arrays of value types are returned when requested as object instances.")]
+        [DisplayName("ArrayNullabilityMode")]
+        [NpgsqlConnectionStringProperty]
+        public ArrayNullabilityMode ArrayNullabilityMode
+        {
+            get => _arrayNullabilityMode;
+            set
+            {
+                _arrayNullabilityMode = value;
+                SetValue(nameof(ArrayNullabilityMode), value);
+            }
+        }
+
+        ArrayNullabilityMode _arrayNullabilityMode;
+
+        #endregion
+
+        #region Multiplexing
+
+        /// <summary>
+        /// Enables multiplexing, which allows more efficient use of connections.
+        /// </summary>
+        [Category("Multiplexing")]
+        [Description("Enables multiplexing, which allows more efficient use of connections.")]
+        [DisplayName("Multiplexing")]
+        [NpgsqlConnectionStringProperty]
+        [DefaultValue(false)]
+        public bool Multiplexing
+        {
+            get => _multiplexing;
+            set
+            {
+                _multiplexing = value;
+                SetValue(nameof(Multiplexing), value);
+            }
+        }
+        bool _multiplexing;
+
+        /// <summary>
+        /// When multiplexing is enabled, determines the maximum amount of time to wait for further
+        /// commands before flushing to the network. In microseconds, 0 disables waiting altogether.
+        /// </summary>
+        [Category("Multiplexing")]
+        [Description("When multiplexing is enabled, determines the maximum amount of time to wait for further " +
+                     "commands before flushing to the network. In microseconds, 0 disables waiting altogether.")]
+        [DisplayName("Write Coalescing Delay Us")]
+        [NpgsqlConnectionStringProperty]
+        [DefaultValue(0)]
+        public int WriteCoalescingDelayUs
+        {
+            get => _writeCoalescingDelayUs;
+            set
+            {
+                _writeCoalescingDelayUs = value;
+                SetValue(nameof(WriteCoalescingDelayUs), value);
+            }
+        }
+        int _writeCoalescingDelayUs;
+
+        /// <summary>
+        /// When multiplexing is enabled, determines the maximum number of outgoing bytes to buffer before
+        /// flushing to the network.
+        /// </summary>
+        [Category("Multiplexing")]
+        [Description("When multiplexing is enabled, determines the maximum number of outgoing bytes to buffer before " +
+                     "flushing to the network.")]
+        [DisplayName("Write Coalescing Buffer Threshold Bytes")]
+        [NpgsqlConnectionStringProperty]
+        [DefaultValue(1000)]
+        public int WriteCoalescingBufferThresholdBytes
+        {
+            get => _writeCoalescingBufferThresholdBytes;
+            set
+            {
+                _writeCoalescingBufferThresholdBytes = value;
+                SetValue(nameof(WriteCoalescingBufferThresholdBytes), value);
+            }
+        }
+        int _writeCoalescingBufferThresholdBytes;
 
         #endregion
 
@@ -1184,20 +1423,6 @@ namespace Npgsql
         #endregion
 
         #region Properties - Obsolete
-
-        /// <summary>
-        /// Obsolete, see https://www.npgsql.org/doc/release-notes/3.1.html
-        /// </summary>
-        [Category("Obsolete")]
-        [Description("Obsolete, see https://www.npgsql.org/doc/release-notes/3.1.html")]
-        [DisplayName("Connection Lifetime")]
-        [NpgsqlConnectionStringProperty]
-        [Obsolete("The ConnectionLifeTime parameter is no longer supported")]
-        public int ConnectionLifeTime
-        {
-            get => 0;
-            set => throw new NotSupportedException("The ConnectionLifeTime parameter is no longer supported. Please see https://www.npgsql.org/doc/release-notes/3.1.html");
-        }
 
         /// <summary>
         /// Obsolete, see https://www.npgsql.org/doc/release-notes/3.1.html
@@ -1269,9 +1494,31 @@ namespace Npgsql
             set => throw new NotSupportedException("The UseSslStream parameter is no longer supported (SslStream is always used). Please see https://www.npgsql.org/doc/release-notes/4.1.html");
         }
 
+        /// <summary>
+        /// Writes connection performance information to performance counters.
+        /// </summary>
+        [Category("Advanced")]
+        [Description("Writes connection performance information to performance counters.")]
+        [DisplayName("Use Perf Counters")]
+        [NpgsqlConnectionStringProperty]
+        [Obsolete("The UsePerfCounters parameter is no longer supported")]
+        public bool UsePerfCounters
+        {
+            get => false;
+            set => throw new NotSupportedException("The UsePerfCounters parameter is no longer supported. Please see https://www.npgsql.org/doc/release-notes/5.0.html");
+        }
+
         #endregion
 
         #region Misc
+
+        internal void Validate()
+        {
+            if (string.IsNullOrWhiteSpace(Host))
+                throw new ArgumentException("Host can't be null");
+            if (Multiplexing && !Pooling)
+                throw new ArgumentException("Pooling must be on to use multiplexing");
+        }
 
         internal string ToStringWithoutPassword()
         {
@@ -1280,7 +1527,7 @@ namespace Npgsql
             return clone.ToString();
         }
 
-        internal NpgsqlConnectionStringBuilder Clone() => new NpgsqlConnectionStringBuilder(ConnectionString);
+        internal NpgsqlConnectionStringBuilder Clone() => new(ConnectionString);
 
         /// <summary>
         /// Determines whether the specified object is equal to the current object.
@@ -1299,12 +1546,12 @@ namespace Npgsql
         #region IDictionary<string, object>
 
         /// <summary>
-        /// Gets an ICollection{string} containing the keys of the <see cref="NpgsqlConnectionStringBuilder"/>.
+        /// Gets an <see cref="ICollection" /> containing the keys of the <see cref="NpgsqlConnectionStringBuilder"/>.
         /// </summary>
-        public new ICollection<string> Keys => base.Keys.Cast<string>().ToArray();
+        public new ICollection<string> Keys => base.Keys.Cast<string>().ToArray()!;
 
         /// <summary>
-        /// Gets an ICollection{string} containing the values in the <see cref="NpgsqlConnectionStringBuilder"/>.
+        /// Gets an <see cref="ICollection" /> containing the values in the <see cref="NpgsqlConnectionStringBuilder"/>.
         /// </summary>
         public new ICollection<object?> Values => base.Values.Cast<object?>().ToArray();
 
@@ -1337,7 +1584,7 @@ namespace Npgsql
         #endregion IDictionary<string, object>
 
         #region ICustomTypeDescriptor
-
+#nullable disable
 #pragma warning disable CS1591 // Missing XML comment for publicly visible type or member
         protected override void GetProperties(Hashtable propertyDescriptors)
         {
@@ -1356,7 +1603,7 @@ namespace Npgsql
                 propertyDescriptors.Remove(o.DisplayName);
         }
 #pragma warning restore CS1591 // Missing XML comment for publicly visible type or member
-
+#nullable enable
         #endregion
 
         internal static readonly string[] EmptyStringArray = new string[0];
@@ -1436,5 +1683,59 @@ namespace Npgsql
         Require,
     }
 
+    /// <summary>
+    /// Specifies how the mapping of arrays of
+    /// <a href="https://docs.microsoft.com/dotnet/csharp/language-reference/builtin-types/value-types">value types</a>
+    /// behaves with respect to nullability when they are requested via an API returning an <see cref="object"/>.
+    /// </summary>
+    public enum ArrayNullabilityMode
+    {
+        /// <summary>
+        /// Arrays of value types are always returned as non-nullable arrays (e.g. <c>int[]</c>).
+        /// If the PostgreSQL array contains a NULL value, an exception is thrown. This is the default mode.
+        /// </summary>
+        Never,
+        /// <summary>
+        /// Arrays of value types are always returned as nullable arrays (e.g. <c>int?[]</c>).
+        /// </summary>
+        Always,
+        /// <summary>
+        /// The type of array that gets returned is determined at runtime.
+        /// Arrays of value types are returned as non-nullable arrays (e.g. <c>int[]</c>)
+        /// if the actual instance that gets returned doesn't contain null values
+        /// and as nullable arrays (e.g. <c>int?[]</c>) if it does.
+        /// </summary>
+        /// <remarks>When using this setting, make sure that your code is prepared to the fact
+        /// that the actual type of array instances returned from APIs like <see cref="NpgsqlDataReader.GetValue"/>
+        /// may change on a row by row base.</remarks>
+        PerInstance,
+    }
+
+    /// <summary>
+    /// Specifies whether the connection shall be initialized as a physical or
+    /// logical replication connection
+    /// </summary>
+    /// <remarks>
+    /// This enum and its corresponding property are intentionally kept internal as they
+    /// should not be set by users or even be visible in their connection strings.
+    /// Replication connections are a special kind of connection that is encapsulated in
+    /// <see cref="PhysicalReplicationConnection"/>
+    /// and <see cref="LogicalReplicationConnection"/>.
+    /// </remarks>
+    enum ReplicationMode
+    {
+        /// <summary>
+        /// Replication disabled. This is the default
+        /// </summary>
+        Off,
+        /// <summary>
+        /// Physical replication enabled
+        /// </summary>
+        Physical,
+        /// <summary>
+        /// Logical replication enabled
+        /// </summary>
+        Logical
+    }
     #endregion
 }

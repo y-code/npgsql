@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using NpgsqlTypes;
 
@@ -27,9 +28,7 @@ namespace Npgsql
         /// Initializes a new instance of the <see cref="NpgsqlCommandBuilder"/> class.
         /// </summary>
         /// <param name="adapter">The adapter.</param>
-#nullable disable
-        public NpgsqlCommandBuilder(NpgsqlDataAdapter adapter)
-#nullable restore
+        public NpgsqlCommandBuilder(NpgsqlDataAdapter? adapter)
         {
             DataAdapter = adapter;
             QuotePrefix = "\"";
@@ -45,6 +44,7 @@ namespace Npgsql
         ///   <PermissionSet>
         ///   <IPermission class="System.Security.Permissions.FileIOPermission, mscorlib, Version=2.0.3600.0, Culture=neutral, PublicKeyToken=b77a5c561934e089" version="1" PathDiscovery="*AllFiles*" />
         ///   </PermissionSet>
+        [AllowNull]
         public override string QuotePrefix
         {
             get => base.QuotePrefix;
@@ -71,6 +71,7 @@ namespace Npgsql
         ///   <PermissionSet>
         ///   <IPermission class="System.Security.Permissions.FileIOPermission, mscorlib, Version=2.0.3600.0, Culture=neutral, PublicKeyToken=b77a5c561934e089" version="1" PathDiscovery="*AllFiles*" />
         ///   </PermissionSet>
+        [AllowNull]
         public override string QuoteSuffix
         {
             get => base.QuoteSuffix;
@@ -111,8 +112,8 @@ namespace Npgsql
         /// at the data source, optionally using columns for parameter names.
         /// </summary>
         /// <param name="useColumnsForParameterNames">
-        /// If <c>true</c>, generate parameter names matching column names, if possible.
-        /// If <c>false</c>, generate @p1, @p2, and so on.
+        /// If <see langword="true"/>, generate parameter names matching column names, if possible.
+        /// If <see langword="false"/>, generate <c>@p1</c>, <c>@p2</c>, and so on.
         /// </param>
         /// <returns>
         /// The automatically generated <see cref="NpgsqlCommand"/> object required to perform insertions.
@@ -138,8 +139,8 @@ namespace Npgsql
         /// at the data source, optionally using columns for parameter names.
         /// </summary>
         /// <param name="useColumnsForParameterNames">
-        /// If <c>true</c>, generate parameter names matching column names, if possible.
-        /// If <c>false</c>, generate @p1, @p2, and so on.
+        /// If <see langword="true"/>, generate parameter names matching column names, if possible.
+        /// If <see langword="false"/>, generate <c>@p1</c>, <c>@p2</c>, and so on.
         /// </param>
         /// <returns>
         /// The automatically generated <see cref="NpgsqlCommand"/> object required to perform updates.
@@ -165,8 +166,8 @@ namespace Npgsql
         /// at the data source, optionally using columns for parameter names.
         /// </summary>
         /// <param name="useColumnsForParameterNames">
-        /// If <c>true</c>, generate parameter names matching column names, if possible.
-        /// If <c>false</c>, generate @p1, @p2, and so on.
+        /// If <see langword="true"/>, generate parameter names matching column names, if possible.
+        /// If <see langword="false"/>, generate @p1, @p2, and so on.
         /// </param>
         /// <returns>
         /// The automatically generated <see cref="NpgsqlCommand"/> object required to perform deletions.
@@ -207,7 +208,7 @@ namespace Npgsql
                 /// <param name="p">The parameter.</param>
                 /// <param name="row">The row.</param>
                 /// <param name="statementType">Type of the statement.</param>
-                /// <param name="whereClause">if set to <c>true</c> [where clause].</param>
+                /// <param name="whereClause">If set to <see langword="true"/> [where clause].</param>
         protected override void ApplyParameterInfo(DbParameter p, DataRow row, System.Data.StatementType statementType, bool whereClause)
         {
             var param = (NpgsqlParameter)p;

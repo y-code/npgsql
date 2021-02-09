@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using Npgsql.Util;
@@ -105,7 +106,7 @@ namespace Npgsql.Tests
 
             var testCulture = new CultureInfo("fr-FR");
             Assert.AreEqual(",", testCulture.NumberFormat.NumberDecimalSeparator, "decimal seperator");
-            using (new CultureSetter(testCulture))
+            using (TestUtil.SetCurrentCulture(testCulture))
             {
                 input = "1 day 2:3:4.005";
                 test = NpgsqlTimeSpan.Parse(input);
@@ -221,7 +222,7 @@ namespace Npgsql.Tests
 
             var testCulture = new CultureInfo("fr-FR");
             Assert.AreEqual(",", testCulture.NumberFormat.NumberDecimalSeparator, "decimal seperator");
-            using (new CultureSetter(testCulture))
+            using (TestUtil.SetCurrentCulture(testCulture))
             {
                 Assert.AreEqual("14 mons 3 days 04:05:06.007", new NpgsqlTimeSpan(1, 2, 3, 4, 5, 6, 7).ToString());
             }
@@ -282,7 +283,7 @@ namespace Npgsql.Tests
 
             var testCulture = new CultureInfo("fr-FR");
             Assert.AreEqual(",", testCulture.NumberFormat.NumberDecimalSeparator, "decimal seperator");
-            using (new CultureSetter(testCulture))
+            using (TestUtil.SetCurrentCulture(testCulture))
                 Assert.AreEqual("2009-05-31", new NpgsqlDate(2009, 5, 31).ToString());
         }
 
@@ -381,6 +382,25 @@ namespace Npgsql.Tests
             Assert.AreEqual(dateForTestMonths.AddMonths(-13), new NpgsqlDate(2008, 2, 29));
         }
 
+        [Test, IssueLink("https://github.com/npgsql/npgsql/issues/3019")]
+        public void NpgsqlDateTimeMath()
+        {
+            // Note* NpgsqlTimespan treats 1 month as 30 days
+            Assert.That(new NpgsqlDateTime(2020, 1, 1, 0, 0, 0).Add(new NpgsqlTimeSpan(1, 2, 0)),
+                Is.EqualTo(new NpgsqlDateTime(2020, 2, 2, 0, 0, 0)));
+            Assert.That(new NpgsqlDateTime(2020, 1, 1, 0, 0, 0).Add(new NpgsqlTimeSpan(0, -1, 0)),
+                Is.EqualTo(new NpgsqlDateTime(2019, 12, 31, 0, 0, 0)));
+            Assert.That(new NpgsqlDateTime(2020, 1, 1, 0, 0, 0).Add(new NpgsqlTimeSpan(0, 0, 0)),
+                Is.EqualTo(new NpgsqlDateTime(2020, 1, 1, 0, 0, 0)));
+            Assert.That(new NpgsqlDateTime(2020, 1, 1, 0, 0, 0).Add(new NpgsqlTimeSpan(0, 0, 10000000)),
+                Is.EqualTo(new NpgsqlDateTime(2020, 1, 1, 0, 0, 1)));
+            Assert.That(new NpgsqlDateTime(2020, 1, 1, 0, 0, 0).Subtract(new NpgsqlTimeSpan(1, 1, 0)),
+                Is.EqualTo(new NpgsqlDateTime(2019, 12, 1, 0, 0, 0)));
+            // Add 1 month = 2020-03-01 then add 30 days (1 month in npgsqlTimespan = 30 days) = 2020-03-31
+            Assert.That(new NpgsqlDateTime(2020, 2, 1, 0, 0, 0).AddMonths(1).Add(new NpgsqlTimeSpan(1, 0, 0)),
+                Is.EqualTo(new NpgsqlDateTime(2020, 3, 31, 0, 0, 0)));
+        }
+
         [Test]
         public void TsVector()
         {
@@ -453,6 +473,95 @@ namespace Npgsql.Tests
             Assert.Throws(typeof(FormatException), () => NpgsqlTsQuery.Parse("<>"));
             Assert.Throws(typeof(FormatException), () => NpgsqlTsQuery.Parse("a <a> b"));
             Assert.Throws(typeof(FormatException), () => NpgsqlTsQuery.Parse("a <-1> b"));
+        }
+
+        [Test]
+        public void TsQueryEquatibility()
+        {
+            //Debugger.Launch();
+            AreEqual(
+                new NpgsqlTsQueryLexeme("lexeme"),
+                new NpgsqlTsQueryLexeme("lexeme"));
+
+            AreEqual(
+                new NpgsqlTsQueryLexeme("lexeme", NpgsqlTsQueryLexeme.Weight.A | NpgsqlTsQueryLexeme.Weight.B),
+                new NpgsqlTsQueryLexeme("lexeme", NpgsqlTsQueryLexeme.Weight.A | NpgsqlTsQueryLexeme.Weight.B));
+
+            AreEqual(
+                new NpgsqlTsQueryLexeme("lexeme", NpgsqlTsQueryLexeme.Weight.A | NpgsqlTsQueryLexeme.Weight.B, true),
+                new NpgsqlTsQueryLexeme("lexeme", NpgsqlTsQueryLexeme.Weight.A | NpgsqlTsQueryLexeme.Weight.B, true));
+
+            AreEqual(
+                new NpgsqlTsQueryNot(new NpgsqlTsQueryLexeme("not")),
+                new NpgsqlTsQueryNot(new NpgsqlTsQueryLexeme("not")));
+
+            AreEqual(
+                new NpgsqlTsQueryAnd(new NpgsqlTsQueryLexeme("left"), new NpgsqlTsQueryLexeme("right")),
+                new NpgsqlTsQueryAnd(new NpgsqlTsQueryLexeme("left"), new NpgsqlTsQueryLexeme("right")));
+
+            AreEqual(
+                new NpgsqlTsQueryOr(new NpgsqlTsQueryLexeme("left"), new NpgsqlTsQueryLexeme("right")),
+                new NpgsqlTsQueryOr(new NpgsqlTsQueryLexeme("left"), new NpgsqlTsQueryLexeme("right")));
+
+            AreEqual(
+                new NpgsqlTsQueryFollowedBy(new NpgsqlTsQueryLexeme("left"), 0, new NpgsqlTsQueryLexeme("right")),
+                new NpgsqlTsQueryFollowedBy(new NpgsqlTsQueryLexeme("left"), 0, new NpgsqlTsQueryLexeme("right")));
+
+            AreEqual(
+                new NpgsqlTsQueryFollowedBy(new NpgsqlTsQueryLexeme("left"), 1, new NpgsqlTsQueryLexeme("right")),
+                new NpgsqlTsQueryFollowedBy(new NpgsqlTsQueryLexeme("left"), 1, new NpgsqlTsQueryLexeme("right")));
+
+            AreEqual(
+                new NpgsqlTsQueryEmpty(),
+                new NpgsqlTsQueryEmpty());
+
+            AreNotEqual(
+                new NpgsqlTsQueryLexeme("lexeme a"),
+                new NpgsqlTsQueryLexeme("lexeme b"));
+
+            AreNotEqual(
+                new NpgsqlTsQueryLexeme("lexeme", NpgsqlTsQueryLexeme.Weight.A | NpgsqlTsQueryLexeme.Weight.D),
+                new NpgsqlTsQueryLexeme("lexeme", NpgsqlTsQueryLexeme.Weight.A | NpgsqlTsQueryLexeme.Weight.B));
+
+            AreNotEqual(
+                new NpgsqlTsQueryLexeme("lexeme", NpgsqlTsQueryLexeme.Weight.A | NpgsqlTsQueryLexeme.Weight.B, true),
+                new NpgsqlTsQueryLexeme("lexeme", NpgsqlTsQueryLexeme.Weight.A | NpgsqlTsQueryLexeme.Weight.B, false));
+
+            AreNotEqual(
+                new NpgsqlTsQueryNot(new NpgsqlTsQueryLexeme("not")),
+                new NpgsqlTsQueryNot(new NpgsqlTsQueryLexeme("ton")));
+
+            AreNotEqual(
+                new NpgsqlTsQueryAnd(new NpgsqlTsQueryLexeme("right"), new NpgsqlTsQueryLexeme("left")),
+                new NpgsqlTsQueryAnd(new NpgsqlTsQueryLexeme("left"), new NpgsqlTsQueryLexeme("right")));
+
+            AreNotEqual(
+                new NpgsqlTsQueryOr(new NpgsqlTsQueryLexeme("right"), new NpgsqlTsQueryLexeme("left")),
+                new NpgsqlTsQueryOr(new NpgsqlTsQueryLexeme("left"), new NpgsqlTsQueryLexeme("right")));
+
+            AreNotEqual(
+                new NpgsqlTsQueryFollowedBy(new NpgsqlTsQueryLexeme("right"), 0, new NpgsqlTsQueryLexeme("left")),
+                new NpgsqlTsQueryFollowedBy(new NpgsqlTsQueryLexeme("left"), 0, new NpgsqlTsQueryLexeme("right")));
+
+            AreNotEqual(
+                new NpgsqlTsQueryFollowedBy(new NpgsqlTsQueryLexeme("left"), 0, new NpgsqlTsQueryLexeme("right")),
+                new NpgsqlTsQueryFollowedBy(new NpgsqlTsQueryLexeme("left"), 1, new NpgsqlTsQueryLexeme("right")));
+
+            void AreEqual(NpgsqlTsQuery left, NpgsqlTsQuery right)
+            {
+                Assert.True(left == right);
+                Assert.False(left != right);
+                Assert.AreEqual(left, right);
+                Assert.AreEqual(left.GetHashCode(), right.GetHashCode());
+            }
+
+            void AreNotEqual(NpgsqlTsQuery left, NpgsqlTsQuery right)
+            {
+                Assert.False(left == right);
+                Assert.True(left != right);
+                Assert.AreNotEqual(left, right);
+                Assert.AreNotEqual(left.GetHashCode(), right.GetHashCode());
+            }
         }
 
         [Test]

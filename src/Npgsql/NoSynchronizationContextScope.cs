@@ -13,23 +13,23 @@ namespace Npgsql
     /// (see https://github.com/npgsql/npgsql/issues/1593)
     /// </summary>
     /// <remarks>
-    /// http://stackoverflow.com/a/28307965/640325
+    /// https://stackoverflow.com/a/28307965/640325
     /// </remarks>
     static class NoSynchronizationContextScope
     {
-        internal static Disposable Enter()
-        {
-            var sc = SynchronizationContext.Current;
-            SynchronizationContext.SetSynchronizationContext(null);
-            return new Disposable(sc);
-        }
+        internal static Disposable Enter() => new(SynchronizationContext.Current);
 
         internal struct Disposable : IDisposable
         {
             readonly SynchronizationContext? _synchronizationContext;
 
             internal Disposable(SynchronizationContext? synchronizationContext)
-                => _synchronizationContext = synchronizationContext;
+            {
+                if (synchronizationContext != null)
+                    SynchronizationContext.SetSynchronizationContext(null);
+
+                _synchronizationContext = synchronizationContext;
+            }
 
             public void Dispose()
                 => SynchronizationContext.SetSynchronizationContext(_synchronizationContext);

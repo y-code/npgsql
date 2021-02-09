@@ -1,25 +1,27 @@
+using System;
 using System.Data;
 using System.Data.Common;
-using JetBrains.Annotations;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Npgsql
 {
     /// <summary>
-    /// Represents the method that handles the <see cref="NpgsqlDataAdapter.RowUpdated">RowUpdated</see> events.
+    /// Represents the method that handles the <see cref="NpgsqlDataAdapter.RowUpdated"/> events.
     /// </summary>
     /// <param name="sender">The source of the event.</param>
-    /// <param name="e">A <see cref="NpgsqlRowUpdatedEventArgs">NpgsqlRowUpdatedEventArgs</see> that contains the event data.</param>
+    /// <param name="e">An <see cref="NpgsqlRowUpdatedEventArgs"/> that contains the event data.</param>
     public delegate void NpgsqlRowUpdatedEventHandler(object sender, NpgsqlRowUpdatedEventArgs e);
 
     /// <summary>
-    /// Represents the method that handles the <see cref="NpgsqlDataAdapter.RowUpdating">RowUpdating</see> events.
+    /// Represents the method that handles the <see cref="NpgsqlDataAdapter.RowUpdating"/> events.
     /// </summary>
     /// <param name="sender">The source of the event.</param>
-    /// <param name="e">A <see cref="NpgsqlRowUpdatingEventArgs">NpgsqlRowUpdatingEventArgs</see> that contains the event data.</param>
+    /// <param name="e">An <see cref="NpgsqlRowUpdatingEventArgs"/> that contains the event data.</param>
     public delegate void NpgsqlRowUpdatingEventHandler(object sender, NpgsqlRowUpdatingEventArgs e);
 
     /// <summary>
-    /// This class represents an adapter from many commands: select, update, insert and delete to fill <see cref="System.Data.DataSet">Datasets.</see>
+    /// This class represents an adapter from many commands: select, update, insert and delete to fill a <see cref="System.Data.DataSet"/>.
     /// </summary>
     [System.ComponentModel.DesignerCategory("")]
     public sealed class NpgsqlDataAdapter : DbDataAdapter
@@ -27,7 +29,6 @@ namespace Npgsql
         /// <summary>
         /// Row updated event.
         /// </summary>
-        [PublicAPI]
         public event NpgsqlRowUpdatedEventHandler? RowUpdated;
 
         /// <summary>
@@ -66,7 +67,7 @@ namespace Npgsql
         /// <summary>
         /// Create row updated event.
         /// </summary>
-        protected override RowUpdatedEventArgs CreateRowUpdatedEvent(DataRow dataRow, IDbCommand command,
+        protected override RowUpdatedEventArgs CreateRowUpdatedEvent(DataRow dataRow, IDbCommand? command,
                                                                      System.Data.StatementType statementType,
                                                                      DataTableMapping tableMapping)
             => new NpgsqlRowUpdatedEventArgs(dataRow, command, statementType, tableMapping);
@@ -74,7 +75,7 @@ namespace Npgsql
         /// <summary>
         /// Create row updating event.
         /// </summary>
-        protected override RowUpdatingEventArgs CreateRowUpdatingEvent(DataRow dataRow, IDbCommand command,
+        protected override RowUpdatingEventArgs CreateRowUpdatingEvent(DataRow dataRow, IDbCommand? command,
                                                                        System.Data.StatementType statementType,
                                                                        DataTableMapping tableMapping)
             => new NpgsqlRowUpdatingEventArgs(dataRow, command, statementType, tableMapping);
@@ -105,37 +106,96 @@ namespace Npgsql
         /// <summary>
         /// Delete command.
         /// </summary>
-        public new NpgsqlCommand DeleteCommand
+        public new NpgsqlCommand? DeleteCommand
         {
-            get => (NpgsqlCommand)base.DeleteCommand;
+            get => (NpgsqlCommand?)base.DeleteCommand;
             set => base.DeleteCommand = value;
         }
 
         /// <summary>
         /// Select command.
         /// </summary>
-        public new NpgsqlCommand SelectCommand
+        public new NpgsqlCommand? SelectCommand
         {
-            get => (NpgsqlCommand)base.SelectCommand;
+            get => (NpgsqlCommand?)base.SelectCommand;
             set => base.SelectCommand = value;
         }
 
         /// <summary>
         /// Update command.
         /// </summary>
-        public new NpgsqlCommand UpdateCommand
+        public new NpgsqlCommand? UpdateCommand
         {
-            get => (NpgsqlCommand)base.UpdateCommand;
+            get => (NpgsqlCommand?)base.UpdateCommand;
             set => base.UpdateCommand = value;
         }
 
         /// <summary>
         /// Insert command.
         /// </summary>
-        public new NpgsqlCommand InsertCommand
+        public new NpgsqlCommand? InsertCommand
         {
-            get => (NpgsqlCommand)base.InsertCommand;
+            get => (NpgsqlCommand?)base.InsertCommand;
             set => base.InsertCommand = value;
+        }
+
+        // Temporary implementation, waiting for official support in System.Data via https://github.com/dotnet/runtime/issues/22109
+        internal async Task<int> Fill(DataTable dataTable, bool async, CancellationToken cancellationToken = default)
+        {
+            var command = SelectCommand;
+            var activeConnection = command?.Connection ?? throw new InvalidOperationException("Connection required");
+            var originalState = ConnectionState.Closed;
+
+            try
+            {
+                originalState = activeConnection.State;
+                if (ConnectionState.Closed == originalState)
+                    await activeConnection.Open(async, cancellationToken);
+
+                using var dataReader = await command.ExecuteReader(CommandBehavior.Default, async, cancellationToken);
+
+                return await Fill(dataTable, dataReader, async, cancellationToken);
+            }
+            finally
+            {
+                if (ConnectionState.Closed == originalState)
+                    activeConnection.Close();
+            }
+        }
+
+        async Task<int> Fill(DataTable dataTable, NpgsqlDataReader dataReader, bool async, CancellationToken cancellationToken = default)
+        {
+            dataTable.BeginLoadData();
+            try
+            {
+                var rowsAdded = 0;
+                var count = dataReader.FieldCount;
+                var columnCollection = dataTable.Columns;
+                for (var i = 0; i < count; ++i)
+                {
+                    var fieldName = dataReader.GetName(i);
+                    if (!columnCollection.Contains(fieldName))
+                    {
+                        var fieldType = dataReader.GetFieldType(i);
+                        var dataColumn = new DataColumn(fieldName, fieldType);
+                        columnCollection.Add(dataColumn);
+                    }
+                }
+
+                var values = new object[count];
+
+                while (async ? await dataReader.ReadAsync(cancellationToken) : dataReader.Read())
+                {
+                    dataReader.GetValues(values);
+                    dataTable.LoadDataRow(values, true);
+                    rowsAdded++;
+                }
+                return rowsAdded;
+            }
+            finally
+            {
+                dataTable.EndLoadData();
+            }
         }
     }
 
@@ -143,14 +203,14 @@ namespace Npgsql
 
     public class NpgsqlRowUpdatingEventArgs : RowUpdatingEventArgs
     {
-        public NpgsqlRowUpdatingEventArgs(DataRow dataRow, IDbCommand command, System.Data.StatementType statementType,
+        public NpgsqlRowUpdatingEventArgs(DataRow dataRow, IDbCommand? command, System.Data.StatementType statementType,
                                           DataTableMapping tableMapping)
             : base(dataRow, command, statementType, tableMapping) {}
     }
 
     public class NpgsqlRowUpdatedEventArgs : RowUpdatedEventArgs
     {
-        public NpgsqlRowUpdatedEventArgs(DataRow dataRow, IDbCommand command, System.Data.StatementType statementType,
+        public NpgsqlRowUpdatedEventArgs(DataRow dataRow, IDbCommand? command, System.Data.StatementType statementType,
                                          DataTableMapping tableMapping)
             : base(dataRow, command, statementType, tableMapping) {}
     }

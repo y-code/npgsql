@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Data;
 using System.Diagnostics.CodeAnalysis;
+using System.Threading;
 using System.Threading.Tasks;
+using Npgsql.Internal;
 using Npgsql.TypeMapping;
 using NpgsqlTypes;
 
@@ -23,12 +25,10 @@ namespace Npgsql
         /// <summary>
         /// Gets or sets the value of the parameter. This delegates to <see cref="TypedValue"/>.
         /// </summary>
-#nullable disable
-        public override object Value
-#nullable restore
+        public override object? Value
         {
             get => TypedValue;
-            set => TypedValue = (T)value;
+            set => TypedValue = (T)value!;
         }
 
         #region Constructors
@@ -96,7 +96,28 @@ namespace Npgsql
             return len;
         }
 
-        internal override Task WriteWithLength(NpgsqlWriteBuffer buf, bool async)
-            => Handler!.WriteWithLengthInternal(TypedValue, buf, LengthCache, this, async);
+        internal override Task WriteWithLength(NpgsqlWriteBuffer buf, bool async, CancellationToken cancellationToken = default)
+            => Handler!.WriteWithLengthInternal(TypedValue, buf, LengthCache, this, async, cancellationToken);
+
+        private protected override NpgsqlParameter CloneCore() =>
+            // use fields instead of properties
+            // to avoid auto-initializing something like type_info
+            new NpgsqlParameter<T>
+            {
+                _precision = _precision,
+                _scale = _scale,
+                _size = _size,
+                _cachedDbType = _cachedDbType,
+                _npgsqlDbType = _npgsqlDbType,
+                _dataTypeName = _dataTypeName,
+                Direction = Direction,
+                IsNullable = IsNullable,
+                _name = _name,
+                TrimmedName = TrimmedName,
+                SourceColumn = SourceColumn,
+                SourceVersion = SourceVersion,
+                TypedValue = TypedValue,
+                SourceColumnNullMapping = SourceColumnNullMapping,
+            };
     }
 }

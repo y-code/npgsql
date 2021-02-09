@@ -4,6 +4,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql.BackendMessages;
+using Npgsql.Internal;
 using Npgsql.Logging;
 using static Npgsql.Util.Statics;
 
@@ -13,10 +14,10 @@ namespace Npgsql
 {
     /// <summary>
     /// Provides an API for a raw binary COPY operation, a high-performance data import/export mechanism to
-    /// a PostgreSQL table. Initiated by <see cref="NpgsqlConnection.BeginRawBinaryCopy"/>
+    /// a PostgreSQL table. Initiated by <see cref="NpgsqlConnection.BeginRawBinaryCopy(string)"/>
     /// </summary>
     /// <remarks>
-    /// See http://www.postgresql.org/docs/current/static/sql-copy.html.
+    /// See https://www.postgresql.org/docs/current/static/sql-copy.html.
     /// </remarks>
     public sealed class NpgsqlRawCopyStream : Stream, ICancelable
     {
@@ -29,13 +30,30 @@ namespace Npgsql
         int _leftToReadInDataMsg;
         bool _isDisposed, _isConsumed;
 
-        readonly bool _canRead;
-        readonly bool _canWrite;
+        bool _canRead;
+        bool _canWrite;
 
         internal bool IsBinary { get; private set; }
 
         public override bool CanWrite => _canWrite;
         public override bool CanRead => _canRead;
+
+        public override bool CanTimeout => true;
+        public override int WriteTimeout
+        {
+            get => (int) _writeBuf.Timeout.TotalMilliseconds;
+            set => _writeBuf.Timeout = TimeSpan.FromMilliseconds(value);
+        }
+        public override int ReadTimeout
+        {
+            get => (int) _readBuf.Timeout.TotalMilliseconds;
+            set
+            {
+                _readBuf.Timeout = TimeSpan.FromMilliseconds(value);
+                // While calling the connector it will overwrite our read buffer timeout
+                _connector.UserTimeout = value;
+            }
+        }
 
         /// <summary>
         /// The copy binary format header signature
@@ -50,18 +68,23 @@ namespace Npgsql
 
         #endregion
 
-        #region Constructor
+        #region Constructor / Initializer
 
-        internal NpgsqlRawCopyStream(NpgsqlConnector connector, string copyCommand)
+        internal NpgsqlRawCopyStream(NpgsqlConnector connector)
         {
             _connector = connector;
             _readBuf = connector.ReadBuffer;
             _writeBuf = connector.WriteBuffer;
+        }
 
-            _connector.WriteQuery(copyCommand);
-            _connector.Flush();
+        internal async Task Init(string copyCommand, bool async, CancellationToken cancellationToken = default)
+        {
+            await _connector.WriteQuery(copyCommand, async, cancellationToken);
+            await _connector.Flush(async, cancellationToken);
 
-            var msg = _connector.ReadMessage();
+            using var registration = _connector.StartNestedCancellableOperation(cancellationToken, attemptPgCancellation: false);
+
+            var msg = await _connector.ReadMessage(async);
             switch (msg.Code)
             {
             case BackendMessageCode.CopyInResponse:
@@ -75,7 +98,7 @@ namespace Npgsql
                 IsBinary = copyOutResponse.IsBinary;
                 _canRead = true;
                 break;
-            case BackendMessageCode.CompletedResponse:
+            case BackendMessageCode.CommandComplete:
                 throw new InvalidOperationException(
                     "This API only supports import/export from the client, i.e. COPY commands containing TO/FROM STDIN. " +
                     "To import/export with files on your PostgreSQL machine, simply execute the command with ExecuteNonQuery. " +
@@ -89,46 +112,102 @@ namespace Npgsql
 
         #region Write
 
-        public override void Write(byte[] buffer, int offset, int count) => Write(buffer, offset, count, false).GetAwaiter().GetResult();
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            ValidateArguments(buffer, offset, count);
+            Write(new ReadOnlySpan<byte>(buffer, offset, count));
+        }
 
         public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         {
-            if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled(cancellationToken);
-            using (NoSynchronizationContextScope.Enter())
-                return Write(buffer, offset, count, true);
+            ValidateArguments(buffer, offset, count);
+            return WriteAsync(new Memory<byte>(buffer, offset, count), cancellationToken).AsTask();
         }
 
-        async Task Write(byte[] buffer, int offset, int count, bool async)
+#if NETSTANDARD2_0
+        public void Write(ReadOnlySpan<byte> buffer)
+#else
+        public override void Write(ReadOnlySpan<byte> buffer)
+#endif
         {
             CheckDisposed();
             if (!CanWrite)
                 throw new InvalidOperationException("Stream not open for writing");
 
-            if (count == 0) { return; }
+            if (buffer.Length == 0) { return; }
 
-            if (count <= _writeBuf.WriteSpaceLeft)
+            if (buffer.Length <= _writeBuf.WriteSpaceLeft)
             {
-                _writeBuf.WriteBytes(buffer, offset, count);
+                _writeBuf.WriteBytes(buffer);
                 return;
             }
 
-            try {
+            try
+            {
                 // Value is too big, flush.
-                await FlushAsync(async);
+                Flush();
 
-                if (count <= _writeBuf.WriteSpaceLeft)
+                if (buffer.Length <= _writeBuf.WriteSpaceLeft)
                 {
-                    _writeBuf.WriteBytes(buffer, offset, count);
+                    _writeBuf.WriteBytes(buffer);
                     return;
                 }
 
                 // Value is too big even after a flush - bypass the buffer and write directly.
-                await _writeBuf.DirectWrite(buffer, offset, count, async);
-            } catch {
-                _connector.Break();
+                _writeBuf.DirectWrite(buffer);
+            }
+            catch (Exception e)
+            {
+                _connector.Break(e);
                 Cleanup();
                 throw;
+            }
+        }
+
+#if NETSTANDARD2_0
+        public ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+#else
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+#endif
+        {
+            CheckDisposed();
+            if (!CanWrite)
+                throw new InvalidOperationException("Stream not open for writing");
+            cancellationToken.ThrowIfCancellationRequested();
+            using (NoSynchronizationContextScope.Enter())
+                return WriteAsyncInternal();
+
+            async ValueTask WriteAsyncInternal()
+            {
+                if (buffer.Length == 0)
+                    return;
+
+                if (buffer.Length <= _writeBuf.WriteSpaceLeft)
+                {
+                    _writeBuf.WriteBytes(buffer.Span);
+                    return;
+                }
+
+                try
+                {
+                    // Value is too big, flush.
+                    await FlushAsync(true, cancellationToken);
+
+                    if (buffer.Length <= _writeBuf.WriteSpaceLeft)
+                    {
+                        _writeBuf.WriteBytes(buffer.Span);
+                        return;
+                    }
+
+                    // Value is too big even after a flush - bypass the buffer and write directly.
+                    await _writeBuf.DirectWrite(buffer, true, cancellationToken);
+                }
+                catch (Exception e)
+                {
+                    _connector.Break(e);
+                    Cleanup();
+                    throw;
+                }
             }
         }
 
@@ -139,45 +218,93 @@ namespace Npgsql
             if (cancellationToken.IsCancellationRequested)
                 return Task.FromCanceled(cancellationToken);
             using (NoSynchronizationContextScope.Enter())
-                return FlushAsync(true);
+                return FlushAsync(true, cancellationToken);
         }
 
-        Task FlushAsync(bool async)
+        Task FlushAsync(bool async, CancellationToken cancellationToken = default)
         {
             CheckDisposed();
-            return _writeBuf.Flush(async);
+            return _writeBuf.Flush(async, cancellationToken);
         }
 
         #endregion
 
         #region Read
 
-        public override int Read(byte[] buffer, int offset, int count) => Read(buffer, offset, count, false).GetAwaiter().GetResult();
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            ValidateArguments(buffer, offset, count);
+            return Read(new Span<byte>(buffer, offset, count));
+        }
 
         public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         {
-            if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled<int>(cancellationToken);
-            using (NoSynchronizationContextScope.Enter())
-                return Read(buffer, offset, count, true);
+            ValidateArguments(buffer, offset, count);
+            return ReadAsync(new Memory<byte>(buffer, offset, count), cancellationToken).AsTask();
         }
 
-        async Task<int> Read(byte[] buffer, int offset, int count, bool async)
+#if NETSTANDARD2_0
+        public int Read(Span<byte> span)
+#else
+        public override int Read(Span<byte> span)
+#endif
         {
             CheckDisposed();
             if (!CanRead)
                 throw new InvalidOperationException("Stream not open for reading");
 
-            if (_isConsumed) {
-                return 0;
+            var count = ReadCore(span.Length, false).GetAwaiter().GetResult();
+            if (count > 0)
+                _readBuf.ReadBytes(span.Slice(0, count));
+            return count;
+        }
+
+#if NETSTANDARD2_0
+        public ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+#else
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+#endif
+        {
+            CheckDisposed();
+            if (!CanRead)
+                throw new InvalidOperationException("Stream not open for reading");
+            cancellationToken.ThrowIfCancellationRequested();
+            using (NoSynchronizationContextScope.Enter())
+                return ReadAsyncInternal();
+
+            async ValueTask<int> ReadAsyncInternal()
+            {
+                var count = await ReadCore(buffer.Length, true, cancellationToken);
+                if (count > 0)
+                    _readBuf.ReadBytes(buffer.Slice(0, count).Span);
+                return count;
             }
+        }
+
+        async ValueTask<int> ReadCore(int count, bool async, CancellationToken cancellationToken = default)
+        {
+            if (_isConsumed)
+                return 0;
+
+            using var registration = _connector.StartNestedCancellableOperation(cancellationToken, attemptPgCancellation: false);
 
             if (_leftToReadInDataMsg == 0)
             {
-                // We've consumed the current DataMessage (or haven't yet received the first),
-                // read the next message
-                var msg = await _connector.ReadMessage(async);
-                switch (msg.Code) {
+                IBackendMessage msg;
+                try
+                {
+                    // We've consumed the current DataMessage (or haven't yet received the first),
+                    // read the next message
+                    msg = await _connector.ReadMessage(async);
+                }
+                catch
+                {
+                    Cleanup();
+                    throw;
+                }
+
+                switch (msg.Code)
+                {
                 case BackendMessageCode.CopyData:
                     _leftToReadInDataMsg = ((CopyDataMessage)msg).Length;
                     break;
@@ -195,19 +322,16 @@ namespace Npgsql
 
             // If our buffer is empty, read in more. Otherwise return whatever is there, even if the
             // user asked for more (normal socket behavior)
-            if (_readBuf.ReadBytesLeft == 0) {
+            if (_readBuf.ReadBytesLeft == 0)
                 await _readBuf.ReadMore(async);
-            }
 
             Debug.Assert(_readBuf.ReadBytesLeft > 0);
 
             var maxCount = Math.Min(_readBuf.ReadBytesLeft, _leftToReadInDataMsg);
-            if (count > maxCount) {
+            if (count > maxCount)
                 count = maxCount;
-            }
 
             _leftToReadInDataMsg -= count;
-            _readBuf.ReadBytes(buffer, offset, count);
             return count;
         }
 
@@ -235,7 +359,6 @@ namespace Npgsql
 
             if (CanWrite)
             {
-                _isDisposed = true;
                 _writeBuf.EndCopyMode();
                 _writeBuf.Clear();
                 await _connector.WriteCopyFail(async);
@@ -244,11 +367,14 @@ namespace Npgsql
                 {
                     var msg = await _connector.ReadMessage(async);
                     // The CopyFail should immediately trigger an exception from the read above.
-                    _connector.Break();
-                    throw new NpgsqlException("Expected ErrorResponse when cancelling COPY but got: " + msg.Code);
+                    throw _connector.Break(
+                        new NpgsqlException("Expected ErrorResponse when cancelling COPY but got: " + msg.Code));
                 }
                 catch (PostgresException e)
                 {
+                    _connector.EndUserAction();
+                    Cleanup();
+
                     if (e.SqlState == PostgresErrorCodes.QueryCanceled)
                         return;
                     throw;
@@ -256,7 +382,7 @@ namespace Npgsql
             }
             else
             {
-                _connector.CancelRequest();
+                _connector.PerformPostgresCancellation();
             }
         }
 
@@ -285,19 +411,29 @@ namespace Npgsql
                 {
                     if (!_isConsumed)
                     {
-                        if (_leftToReadInDataMsg > 0)
+                        try
                         {
-                            await _readBuf.Skip(_leftToReadInDataMsg, async);
+                            if (_leftToReadInDataMsg > 0)
+                            {
+                                await _readBuf.Skip(_leftToReadInDataMsg, async);
+                            }
+                            _connector.SkipUntil(BackendMessageCode.ReadyForQuery);
                         }
-                        _connector.SkipUntil(BackendMessageCode.ReadyForQuery);
+                        catch (OperationCanceledException e) when (e.InnerException is PostgresException pg && pg.SqlState == PostgresErrorCodes.QueryCanceled)
+                        {
+                            Log.Debug($"Caught an exception while disposing the {nameof(NpgsqlRawCopyStream)}, indicating that it was cancelled.", e, _connector.Id);
+                        }
+                        catch (Exception e)
+                        {
+                            Log.Error($"Caught an exception while disposing the {nameof(NpgsqlRawCopyStream)}.", e, _connector.Id);
+                        }
                     }
                 }
             }
             finally
             {
-                var connector = _connector;
+                _connector.EndUserAction();
                 Cleanup();
-                connector.EndUserAction();
             }
         }
 
@@ -306,6 +442,7 @@ namespace Npgsql
         {
             Log.Debug("COPY operation ended", _connector.Id);
             _connector.CurrentCopyOperation = null;
+            _connector.Connection!.EndBindingScope(ConnectorBindingScope.Copy);
             _connector = null;
             _readBuf = null;
             _writeBuf = null;
@@ -345,32 +482,41 @@ namespace Npgsql
         }
 
         #endregion
+
+        #region Input validation
+        static void ValidateArguments(byte[] buffer, int offset, int count)
+        {
+            if (buffer == null)
+                throw new ArgumentNullException(nameof(buffer));
+            if (offset < 0)
+                throw new ArgumentNullException(nameof(offset));
+            if (count < 0)
+                throw new ArgumentNullException(nameof(count));
+            if (buffer.Length - offset < count)
+                throw new ArgumentException("Offset and length were out of bounds for the array or count is greater than the number of elements from index to the end of the source collection.");
+        }
+        #endregion
     }
 
     /// <summary>
-    /// Writer for a text import, initiated by <see cref="NpgsqlConnection.BeginTextImport"/>.
+    /// Writer for a text import, initiated by <see cref="NpgsqlConnection.BeginTextImport(string)"/>.
     /// </summary>
     /// <remarks>
-    /// See http://www.postgresql.org/docs/current/static/sql-copy.html.
+    /// See https://www.postgresql.org/docs/current/static/sql-copy.html.
     /// </remarks>
     public sealed class NpgsqlCopyTextWriter : StreamWriter, ICancelable
     {
         internal NpgsqlCopyTextWriter(NpgsqlConnector connector, NpgsqlRawCopyStream underlying) : base(underlying)
         {
             if (underlying.IsBinary)
-            {
-                connector.Break();
-                throw new Exception("Can't use a binary copy stream for text writing");
-            }
+                throw connector.Break(new Exception("Can't use a binary copy stream for text writing"));
         }
 
         /// <summary>
         /// Cancels and terminates an ongoing import. Any data already written will be discarded.
         /// </summary>
         public void Cancel()
-        {
-            ((NpgsqlRawCopyStream)BaseStream).Cancel();
-        }
+            => ((NpgsqlRawCopyStream)BaseStream).Cancel();
 
         /// <summary>
         /// Cancels and terminates an ongoing import. Any data already written will be discarded.
@@ -383,29 +529,24 @@ namespace Npgsql
     }
 
     /// <summary>
-    /// Reader for a text export, initiated by <see cref="NpgsqlConnection.BeginTextExport"/>.
+    /// Reader for a text export, initiated by <see cref="NpgsqlConnection.BeginTextExport(string)"/>.
     /// </summary>
     /// <remarks>
-    /// See http://www.postgresql.org/docs/current/static/sql-copy.html.
+    /// See https://www.postgresql.org/docs/current/static/sql-copy.html.
     /// </remarks>
     public sealed class NpgsqlCopyTextReader : StreamReader, ICancelable
     {
         internal NpgsqlCopyTextReader(NpgsqlConnector connector, NpgsqlRawCopyStream underlying) : base(underlying)
         {
             if (underlying.IsBinary)
-            {
-                connector.Break();
-                throw new Exception("Can't use a binary copy stream for text reading");
-            }
+                throw connector.Break(new Exception("Can't use a binary copy stream for text reading"));
         }
 
         /// <summary>
         /// Cancels and terminates an ongoing import.
         /// </summary>
         public void Cancel()
-        {
-            ((NpgsqlRawCopyStream)BaseStream).Cancel();
-        }
+            => ((NpgsqlRawCopyStream)BaseStream).Cancel();
 
         /// <summary>
         /// Cancels and terminates an ongoing import. Any data already written will be discarded.

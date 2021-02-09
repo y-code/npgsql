@@ -1,13 +1,16 @@
 ﻿using System;
 using System.Data;
+using System.Threading.Tasks;
 using Npgsql.BackendMessages;
+using Npgsql.Internal;
+using Npgsql.Internal.TypeHandlers;
+using Npgsql.Internal.TypeHandlers.NumericHandlers;
+using Npgsql.Internal.TypeHandling;
 using Npgsql.PostgresTypes;
-using Npgsql.TypeHandlers;
-using Npgsql.TypeHandlers.NumericHandlers;
-using Npgsql.TypeHandling;
 using Npgsql.TypeMapping;
 using NpgsqlTypes;
 using NUnit.Framework;
+using static Npgsql.Tests.TestUtil;
 
 namespace Npgsql.Tests
 {
@@ -18,32 +21,31 @@ namespace Npgsql.Tests
         public void GlobalMapping()
         {
             var myFactory = MapMyIntGlobally();
-            using (var conn = OpenLocalConnection())
-            using (var cmd = new NpgsqlCommand("SELECT @p", conn))
+            using var pool = CreateTempPool(ConnectionString, out var connectionString);
+            using var conn = OpenConnection(connectionString);
+            using var cmd = new NpgsqlCommand("SELECT @p", conn);
+            var range = new NpgsqlRange<int>(8, true, false, 0, false, true);
+            var parameters = new[]
             {
-                var range = new NpgsqlRange<int>(8, true, false, 0, false, true);
-                var parameters = new[]
-                {
-                    // Base
-                    new NpgsqlParameter("p", NpgsqlDbType.Integer) { Value = 8 },
-                    new NpgsqlParameter("p", DbType.Int32) { Value = 8 },
-                    new NpgsqlParameter { ParameterName = "p", Value = 8 },
-                    // Array
-                    new NpgsqlParameter { ParameterName = "p", Value = new[] { 8 } },
-                    new NpgsqlParameter("p", NpgsqlDbType.Array | NpgsqlDbType.Integer) { Value = new[] { 8 } },
-                    // Range
-                    new NpgsqlParameter { ParameterName = "p", Value = range },
-                    new NpgsqlParameter("p", NpgsqlDbType.Range | NpgsqlDbType.Integer) { Value = range },
-                };
+                // Base
+                new NpgsqlParameter("p", NpgsqlDbType.Integer) { Value = 8 },
+                new NpgsqlParameter("p", DbType.Int32) { Value = 8 },
+                new NpgsqlParameter { ParameterName = "p", Value = 8 },
+                // Array
+                new NpgsqlParameter { ParameterName = "p", Value = new[] { 8 } },
+                new NpgsqlParameter("p", NpgsqlDbType.Array | NpgsqlDbType.Integer) { Value = new[] { 8 } },
+                // Range
+                new NpgsqlParameter { ParameterName = "p", Value = range },
+                new NpgsqlParameter("p", NpgsqlDbType.Range | NpgsqlDbType.Integer) { Value = range },
+            };
 
-                for (var i = 0; i < parameters.Length; i++)
-                {
-                    cmd.Parameters.Add(parameters[i]);
-                    cmd.ExecuteScalar();
-                    Assert.That(myFactory.Reads, Is.EqualTo(i+1));
-                    Assert.That(myFactory.Writes, Is.EqualTo(i+1));
-                    cmd.Parameters.Clear();
-                }
+            for (var i = 0; i < parameters.Length; i++)
+            {
+                cmd.Parameters.Add(parameters[i]);
+                cmd.ExecuteScalar();
+                Assert.That(myFactory.Reads, Is.EqualTo(i+1));
+                Assert.That(myFactory.Writes, Is.EqualTo(i+1));
+                cmd.Parameters.Clear();
             }
         }
 
@@ -51,7 +53,9 @@ namespace Npgsql.Tests
         public void LocalMapping()
         {
             MyInt32HandlerFactory myFactory;
-            using (var conn = OpenLocalConnection())
+            using var _ = CreateTempPool(ConnectionString, out var connectionString);
+
+            using (var conn = OpenConnection(connectionString))
             using (var cmd = new NpgsqlCommand("SELECT @p", conn))
             {
                 myFactory = MapMyIntLocally(conn);
@@ -60,8 +64,9 @@ namespace Npgsql.Tests
                 Assert.That(myFactory.Reads, Is.EqualTo(1));
                 Assert.That(myFactory.Writes, Is.EqualTo(1));
             }
+
             // Make sure reopening (same physical connection) reverts the mapping
-            using (var conn = OpenLocalConnection())
+            using (var conn = OpenConnection(connectionString))
             using (var cmd = new NpgsqlCommand("SELECT @p", conn))
             {
                 cmd.Parameters.AddWithValue("p", 8);
@@ -75,20 +80,22 @@ namespace Npgsql.Tests
         public void RemoveGlobalMapping()
         {
             NpgsqlConnection.GlobalTypeMapper.RemoveMapping("integer");
-            using (var conn = OpenLocalConnection())
-                Assert.That(() => conn.ExecuteScalar("SELECT 8"), Throws.TypeOf<NotSupportedException>());
+            using var _ = CreateTempPool(ConnectionString, out var connectionString);
+            using var conn = OpenConnection(connectionString);
+            Assert.That(() => conn.ExecuteScalar("SELECT 8"), Throws.TypeOf<NotSupportedException>());
         }
 
         [Test]
         public void RemoveLocalMapping()
         {
-            using (var conn = OpenLocalConnection())
+            using var _ = CreateTempPool(ConnectionString, out var connectionString);
+            using (var conn = OpenConnection(connectionString))
             {
                 conn.TypeMapper.RemoveMapping("integer");
                 Assert.That(() => conn.ExecuteScalar("SELECT 8"), Throws.TypeOf<NotSupportedException>());
             }
             // Make sure reopening (same physical connection) reverts the mapping
-            using (var conn = OpenLocalConnection())
+            using (var conn = OpenConnection(connectionString))
                 Assert.That(conn.ExecuteScalar("SELECT 8"), Is.EqualTo(8));
         }
 
@@ -96,18 +103,20 @@ namespace Npgsql.Tests
         public void GlobalReset()
         {
             var myFactory = MapMyIntGlobally();
-            using (OpenLocalConnection()) {}
+            using var _ = CreateTempPool(ConnectionString, out var connectionString);
+
+            using (OpenConnection(connectionString)) {}
             // We now have a connector in the pool with our custom mapping
 
             NpgsqlConnection.GlobalTypeMapper.Reset();
-            using (var conn = OpenLocalConnection())
+            using (var conn = OpenConnection(connectionString))
             {
                 // Should be the pooled connector from before, but it should have picked up the reset
                 conn.ExecuteScalar("SELECT 1");
                 Assert.That(myFactory.Reads, Is.Zero);
 
                 // Now create a second *physical* connection to make sure it picks up the new mapping as well
-                using (var conn2 = OpenLocalConnection())
+                using (var conn2 = OpenConnection(connectionString))
                 {
                     conn2.ExecuteScalar("SELECT 1");
                     Assert.That(myFactory.Reads, Is.Zero);
@@ -119,9 +128,10 @@ namespace Npgsql.Tests
         [Test]
         public void DomainMappingNotSupported()
         {
-             // PostgreSQL sends RowDescription with the OID of the base type, not the domain,
-             // it's not possible to map domains
-            using (var conn = OpenLocalConnection())
+            // PostgreSQL sends RowDescription with the OID of the base type, not the domain,
+            // it's not possible to map domains
+            using (CreateTempPool(ConnectionString, out var connectionString))
+            using (var conn = OpenConnection(connectionString))
             {
                 conn.ExecuteNonQuery(@"CREATE DOMAIN pg_temp.us_postal_code AS TEXT
 CHECK
@@ -153,11 +163,12 @@ CHECK
         }
 
         [Test]
-        public void StringToCitext()
+        public async Task StringToCitext()
         {
-            using (var conn = OpenLocalConnection())
+            using (CreateTempPool(ConnectionString, out var connectionString))
+            using (var conn = OpenConnection(connectionString))
             {
-                TestUtil.EnsureExtension(conn, "citext");
+                await EnsureExtensionAsync(conn, "citext");
 
                 conn.TypeMapper.RemoveMapping("text");
                 conn.TypeMapper.AddMapping(new NpgsqlTypeMappingBuilder
@@ -238,21 +249,9 @@ CHECK
             }
         }
 
-        NpgsqlConnection OpenLocalConnection() => OpenConnection(LocalConnString);
-
-        static readonly string LocalConnString = new NpgsqlConnectionStringBuilder(ConnectionString)
-        {
-            ApplicationName = nameof(TypeMapperTests)
-        }.ToString();
-
         #endregion Support
 
         [TearDown]
-        public void TearDown()
-        {
-            NpgsqlConnection.GlobalTypeMapper.Reset();
-            using (var conn = new NpgsqlConnection(LocalConnString))
-                NpgsqlConnection.ClearPool(conn);
-        }
+        public void TearDown() => NpgsqlConnection.GlobalTypeMapper.Reset();
     }
 }

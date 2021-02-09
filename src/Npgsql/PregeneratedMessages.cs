@@ -2,6 +2,7 @@
 using System.IO;
 using System.Linq;
 using System.Text;
+using Npgsql.Internal;
 
 namespace Npgsql
 {
@@ -12,7 +13,7 @@ namespace Npgsql
 #pragma warning disable CS8625
             // This is the only use of a write buffer without a connector, for in-memory construction of
             // pregenerated messages.
-            var buf = new NpgsqlWriteBuffer(null, new MemoryStream(), NpgsqlWriteBuffer.MinimumSize, Encoding.ASCII);
+            using var buf = new NpgsqlWriteBuffer(null, new MemoryStream(), null, NpgsqlWriteBuffer.MinimumSize, Encoding.ASCII);
 #pragma warning restore CS8625
 
             BeginTransRepeatableRead    = Generate(buf, "BEGIN ISOLATION LEVEL REPEATABLE READ");
@@ -21,7 +22,6 @@ namespace Npgsql
             BeginTransReadUncommitted   = Generate(buf, "BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED");
             CommitTransaction           = Generate(buf, "COMMIT");
             RollbackTransaction         = Generate(buf, "ROLLBACK");
-            KeepAlive                   = Generate(buf, "SELECT NULL");
             DiscardAll                  = Generate(buf, "DISCARD ALL");
         }
 
@@ -50,7 +50,6 @@ namespace Npgsql
         internal static readonly byte[] BeginTransReadUncommitted;
         internal static readonly byte[] CommitTransaction;
         internal static readonly byte[] RollbackTransaction;
-        internal static readonly byte[] KeepAlive;
 
         internal static readonly byte[] DiscardAll;
     }

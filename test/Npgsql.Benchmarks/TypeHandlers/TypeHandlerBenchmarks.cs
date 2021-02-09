@@ -2,11 +2,12 @@
 using BenchmarkDotNet.Columns;
 using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Diagnosers;
-using Npgsql.TypeHandling;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using Npgsql.Internal;
+using Npgsql.Internal.TypeHandling;
 using Npgsql.PostgresTypes;
 using Npgsql.Util;
 
@@ -20,8 +21,8 @@ namespace Npgsql.Benchmarks.TypeHandlers
         {
             public Config()
             {
-                Add(StatisticColumn.OperationsPerSecond);
-                Add(MemoryDiagnoser.Default);
+                AddColumn(StatisticColumn.OperationsPerSecond);
+                AddDiagnoser(MemoryDiagnoser.Default);
             }
         }
 
@@ -50,8 +51,8 @@ namespace Npgsql.Benchmarks.TypeHandlers
         {
             _stream = new EndlessStream();
             _handler = handler ?? throw new ArgumentNullException(nameof(handler));
-            _readBuffer = new NpgsqlReadBuffer(null, _stream, NpgsqlReadBuffer.MinimumSize, Encoding.UTF8, PGUtil.RelaxedUTF8Encoding);
-            _writeBuffer = new NpgsqlWriteBuffer(null, _stream, NpgsqlWriteBuffer.MinimumSize, Encoding.UTF8);
+            _readBuffer = new NpgsqlReadBuffer(null, _stream, null, NpgsqlReadBuffer.MinimumSize, Encoding.UTF8, PGUtil.RelaxedUTF8Encoding);
+            _writeBuffer = new NpgsqlWriteBuffer(null, _stream, null, NpgsqlWriteBuffer.MinimumSize, Encoding.UTF8);
         }
 
         protected static PostgresType GetPostgresType(string pgType)

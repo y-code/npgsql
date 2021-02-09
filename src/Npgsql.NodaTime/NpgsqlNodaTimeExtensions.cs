@@ -1,6 +1,7 @@
-﻿using System.Data;
+﻿using System;
+using System.Data;
 using NodaTime;
-using Npgsql.NodaTime;
+using Npgsql.NodaTime.Internal;
 using Npgsql.TypeMapping;
 using NpgsqlTypes;
 
@@ -20,10 +21,10 @@ namespace Npgsql
             => mapper
                 .AddMapping(new NpgsqlTypeMappingBuilder
                 {
-                    PgTypeName = "timestamp",
+                    PgTypeName = "timestamp without time zone",
                     NpgsqlDbType = NpgsqlDbType.Timestamp,
                     DbTypes = new[] { DbType.DateTime, DbType.DateTime2 },
-                    ClrTypes = new[] { typeof(Instant), typeof(LocalDateTime) },
+                    ClrTypes = new[] { typeof(Instant), typeof(LocalDateTime), typeof(DateTime) },
                     InferredDbType = DbType.DateTime,
                     TypeHandlerFactory = new TimestampHandlerFactory()
                 }.Build())
@@ -31,7 +32,7 @@ namespace Npgsql
                 {
                     PgTypeName = "timestamp with time zone",
                     NpgsqlDbType = NpgsqlDbType.TimestampTz,
-                    ClrTypes = new[] { typeof(ZonedDateTime), typeof(OffsetDateTime) },
+                    ClrTypes = new[] { typeof(ZonedDateTime), typeof(OffsetDateTime), typeof(DateTimeOffset) },
                     TypeHandlerFactory = new TimestampTzHandlerFactory()
                 }.Build())
                 .AddMapping(new NpgsqlTypeMappingBuilder
@@ -39,12 +40,12 @@ namespace Npgsql
                     PgTypeName = "date",
                     NpgsqlDbType = NpgsqlDbType.Date,
                     DbTypes = new[] { DbType.Date },
-                    ClrTypes = new[] { typeof(LocalDate) },
+                    ClrTypes = new[] { typeof(LocalDate),  typeof(NpgsqlDate) },
                     TypeHandlerFactory = new DateHandlerFactory()
                 }.Build())
                 .AddMapping(new NpgsqlTypeMappingBuilder
                 {
-                    PgTypeName = "time",
+                    PgTypeName = "time without time zone",
                     NpgsqlDbType = NpgsqlDbType.Time,
                     DbTypes = new[] { DbType.Time },
                     ClrTypes = new[] { typeof(LocalTime) },
@@ -61,7 +62,7 @@ namespace Npgsql
                 {
                     PgTypeName = "interval",
                     NpgsqlDbType = NpgsqlDbType.Interval,
-                    ClrTypes = new[] { typeof(Period) },
+                    ClrTypes = new[] { typeof(Period), typeof(Duration), typeof(TimeSpan), typeof(NpgsqlTimeSpan) },
                     TypeHandlerFactory = new IntervalHandlerFactory()
                 }.Build());
     }

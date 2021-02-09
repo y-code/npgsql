@@ -4,8 +4,9 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql.BackendMessages;
+using Npgsql.Internal;
+using Npgsql.Internal.TypeHandling;
 using Npgsql.Logging;
-using Npgsql.TypeHandling;
 using Npgsql.TypeMapping;
 using NpgsqlTypes;
 using static Npgsql.Util.Statics;
@@ -14,7 +15,7 @@ namespace Npgsql
 {
     /// <summary>
     /// Provides an API for a binary COPY TO operation, a high-performance data export mechanism from
-    /// a PostgreSQL table. Initiated by <see cref="NpgsqlConnection.BeginBinaryExport"/>
+    /// a PostgreSQL table. Initiated by <see cref="NpgsqlConnection.BeginBinaryExport(string)"/>
     /// </summary>
     public sealed class NpgsqlBinaryExporter : ICancelable, IAsyncDisposable
     {
@@ -31,39 +32,60 @@ namespace Npgsql
         /// <summary>
         /// The number of columns, as returned from the backend in the CopyInResponse.
         /// </summary>
-        internal int NumColumns { get; }
+        internal int NumColumns { get; private set; }
 
-        readonly NpgsqlTypeHandler?[] _typeHandlerCache;
+        NpgsqlTypeHandler?[] _typeHandlerCache;
+
         static readonly NpgsqlLogger Log = NpgsqlLogManager.CreateLogger(nameof(NpgsqlBinaryExporter));
+
+        /// <summary>
+        /// Current timeout
+        /// </summary>
+        public TimeSpan Timeout
+        {
+            set
+            {
+                _buf.Timeout = value;
+                // While calling Complete(), we're using the connector, which overwrites the buffer's timeout with it's own
+                _connector.UserTimeout = (int)value.TotalMilliseconds;
+            }
+        }
 
         #endregion
 
         #region Construction / Initialization
 
-        internal NpgsqlBinaryExporter(NpgsqlConnector connector, string copyToCommand)
+        internal NpgsqlBinaryExporter(NpgsqlConnector connector)
         {
             _connector = connector;
             _buf = connector.ReadBuffer;
             _typeMapper = connector.TypeMapper;
             _columnLen = int.MinValue;   // Mark that the (first) column length hasn't been read yet
             _column = -1;
+            _typeHandlerCache = null!;
+        }
 
-            _connector.WriteQuery(copyToCommand);
-            _connector.Flush();
+        internal async Task Init(string copyToCommand, bool async, CancellationToken cancellationToken = default)
+        {
+            await _connector.WriteQuery(copyToCommand, async, cancellationToken);
+            await _connector.Flush(async, cancellationToken);
+
+            using var registration = _connector.StartNestedCancellableOperation(cancellationToken, attemptPgCancellation: false);
 
             CopyOutResponseMessage copyOutResponse;
-            var msg = _connector.ReadMessage();
+            var msg = await _connector.ReadMessage(async);
             switch (msg.Code)
             {
             case BackendMessageCode.CopyOutResponse:
-                copyOutResponse = (CopyOutResponseMessage)msg;
+                copyOutResponse = (CopyOutResponseMessage) msg;
                 if (!copyOutResponse.IsBinary)
                 {
-                    _connector.Break();
-                    throw new ArgumentException("copyToCommand triggered a text transfer, only binary is allowed", nameof(copyToCommand));
+                    throw _connector.Break(
+                        new ArgumentException("copyToCommand triggered a text transfer, only binary is allowed",
+                            nameof(copyToCommand)));
                 }
                 break;
-            case BackendMessageCode.CompletedResponse:
+            case BackendMessageCode.CommandComplete:
                 throw new InvalidOperationException(
                     "This API only supports import/export from the client, i.e. COPY commands containing TO/FROM STDIN. " +
                     "To import/export with files on your PostgreSQL machine, simply execute the command with ExecuteNonQuery. " +
@@ -74,14 +96,14 @@ namespace Npgsql
 
             NumColumns = copyOutResponse.NumColumns;
             _typeHandlerCache = new NpgsqlTypeHandler[NumColumns];
-            ReadHeader();
+            await ReadHeader(async);
         }
 
-        void ReadHeader()
+        async Task ReadHeader(bool async)
         {
-            _leftToReadInDataMsg = Expect<CopyDataMessage>(_connector.ReadMessage(), _connector).Length;
+            _leftToReadInDataMsg = Expect<CopyDataMessage>(await _connector.ReadMessage(async), _connector).Length;
             var headerLen = NpgsqlRawCopyStream.BinarySignature.Length + 4 + 4;
-            _buf.Ensure(headerLen);
+            await _buf.Ensure(headerLen, async);
 
             if (NpgsqlRawCopyStream.BinarySignature.Any(t => _buf.ReadByte() != t))
                 throw new NpgsqlException("Invalid COPY binary signature at beginning!");
@@ -116,17 +138,17 @@ namespace Npgsql
         /// </returns>
         public ValueTask<int> StartRowAsync(CancellationToken cancellationToken = default)
         {
-            if (cancellationToken.IsCancellationRequested)
-                return new ValueTask<int>(Task.FromCanceled<int>(cancellationToken));
             using (NoSynchronizationContextScope.Enter())
-                return StartRow(true);
+                return StartRow(true, cancellationToken);
         }
 
-        async ValueTask<int> StartRow(bool async)
+        async ValueTask<int> StartRow(bool async, CancellationToken cancellationToken = default)
         {
             CheckDisposed();
             if (_isConsumed)
                 return -1;
+
+            using var registration = _connector.StartNestedCancellableOperation(cancellationToken);
 
             // The very first row (i.e. _column == -1) is included in the header's CopyData message.
             // Otherwise we need to read in a new CopyData row (the docs specify that there's a CopyData
@@ -181,15 +203,14 @@ namespace Npgsql
         /// <returns>The value of the column</returns>
         public ValueTask<T> ReadAsync<T>(CancellationToken cancellationToken = default)
         {
-            if (cancellationToken.IsCancellationRequested)
-                return new ValueTask<T>(Task.FromCanceled<T>(cancellationToken));
             using (NoSynchronizationContextScope.Enter())
-                return Read<T>(true);
+                return Read<T>(true, cancellationToken);
         }
 
-        ValueTask<T> Read<T>(bool async)
+        ValueTask<T> Read<T>(bool async, CancellationToken cancellationToken = default)
         {
             CheckDisposed();
+
             if (_column == -1 || _column == NumColumns)
                 throw new InvalidOperationException("Not reading a row");
 
@@ -198,7 +219,7 @@ namespace Npgsql
             if (handler == null)
                 handler = _typeHandlerCache[_column] = _typeMapper.GetByClrType(type);
 
-            return DoRead<T>(handler, async);
+            return DoRead<T>(handler, async, cancellationToken);
         }
 
         /// <summary>
@@ -227,18 +248,18 @@ namespace Npgsql
         /// type, for which <typeparamref name="T"/> will be a simple string but for which
         /// <paramref name="type"/> must be specified as <see cref="NpgsqlDbType.Jsonb"/>.
         /// </param>
-        /// <param name="cancellationToken"></param>
+        /// <param name="cancellationToken">
+        /// An optional token to cancel the asynchronous operation. The default value is <see cref="CancellationToken.None"/>.
+        /// </param>
         /// <typeparam name="T">The .NET type of the column to be read.</typeparam>
         /// <returns>The value of the column</returns>
         public ValueTask<T> ReadAsync<T>(NpgsqlDbType type, CancellationToken cancellationToken = default)
         {
-            if (cancellationToken.IsCancellationRequested)
-                return new ValueTask<T>(Task.FromCanceled<T>(cancellationToken));
             using (NoSynchronizationContextScope.Enter())
-                return Read<T>(type, true);
+                return Read<T>(type, true, cancellationToken);
         }
 
-        ValueTask<T> Read<T>(NpgsqlDbType type, bool async)
+        ValueTask<T> Read<T>(NpgsqlDbType type, bool async, CancellationToken cancellationToken = default)
         {
             CheckDisposed();
             if (_column == -1 || _column == NumColumns)
@@ -248,13 +269,15 @@ namespace Npgsql
             if (handler == null)
                 handler = _typeHandlerCache[_column] = _typeMapper.GetByNpgsqlDbType(type);
 
-            return DoRead<T>(handler, async);
+            return DoRead<T>(handler, async, cancellationToken);
         }
 
-        async ValueTask<T> DoRead<T>(NpgsqlTypeHandler handler, bool async)
+        async ValueTask<T> DoRead<T>(NpgsqlTypeHandler handler, bool async, CancellationToken cancellationToken = default)
         {
             try
             {
+                using var registration = _connector.StartNestedCancellableOperation(cancellationToken);
+
                 await ReadColumnLenIfNeeded(async);
 
                 if (_columnLen == -1)
@@ -262,7 +285,7 @@ namespace Npgsql
 #pragma warning disable CS8653 // A default expression introduces a null value when 'T' is a non-nullable reference type.
                     // When T is a Nullable<T>, we support returning null
                     if (NullableHandler<T>.Exists)
-                        return default;
+                        return default!;
 #pragma warning restore CS8653
                     throw new InvalidCastException("Column is null");
                 }
@@ -281,9 +304,9 @@ namespace Npgsql
                 _column++;
                 return result;
             }
-            catch
+            catch (Exception e)
             {
-                _connector.Break();
+                _connector.Break(e);
                 Cleanup();
                 throw;
             }
@@ -311,14 +334,16 @@ namespace Npgsql
         /// </summary>
         public Task SkipAsync(CancellationToken cancellationToken = default)
         {
-            if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled(cancellationToken);
             using (NoSynchronizationContextScope.Enter())
-                return Skip(true);
+                return Skip(true, cancellationToken);
         }
 
-        async Task Skip(bool async)
+        async Task Skip(bool async, CancellationToken cancellationToken = default)
         {
+            CheckDisposed();
+
+            using var registration = _connector.StartNestedCancellableOperation(cancellationToken);
+
             await ReadColumnLenIfNeeded(async);
             if (_columnLen != -1)
                 await _buf.Skip(_columnLen, async);
@@ -354,7 +379,7 @@ namespace Npgsql
         /// <summary>
         /// Cancels an ongoing export.
         /// </summary>
-        public void Cancel() => _connector.CancelRequest();
+        public void Cancel() => _connector.PerformUserCancellation();
 
         /// <summary>
         /// Completes that binary export and sets the connection back to idle state
@@ -378,17 +403,29 @@ namespace Npgsql
 
             if (!_isConsumed)
             {
-                // Finish the current CopyData message
-                _buf.Skip(_leftToReadInDataMsg);
-                // Read to the end
-                _connector.SkipUntil(BackendMessageCode.CopyDone);
-                Expect<CommandCompleteMessage>(await _connector.ReadMessage(async), _connector);
-                Expect<ReadyForQueryMessage>(await _connector.ReadMessage(async), _connector);
+                try
+                {
+                    using var registration = _connector.StartNestedCancellableOperation(attemptPgCancellation: false);
+                    // Finish the current CopyData message
+                    _buf.Skip(_leftToReadInDataMsg);
+                    // Read to the end
+                    _connector.SkipUntil(BackendMessageCode.CopyDone);
+                    // We intentionally do not pass a CancellationToken since we don't want to cancel cleanup
+                    Expect<CommandCompleteMessage>(await _connector.ReadMessage(async), _connector);
+                    Expect<ReadyForQueryMessage>(await _connector.ReadMessage(async), _connector);
+                }
+                catch (OperationCanceledException e) when (e.InnerException is PostgresException pg && pg.SqlState == PostgresErrorCodes.QueryCanceled)
+                {
+                    Log.Debug($"Caught an exception while disposing the {nameof(NpgsqlBinaryExporter)}, indicating that it was cancelled.", e, _connector.Id);
+                }
+                catch (Exception e)
+                {
+                    Log.Error($"Caught an exception while disposing the {nameof(NpgsqlBinaryExporter)}.", e, _connector.Id);
+                }
             }
 
-            var connector = _connector;
+            _connector.EndUserAction();
             Cleanup();
-            connector.EndUserAction();
         }
 
 #pragma warning disable CS8625
@@ -400,6 +437,7 @@ namespace Npgsql
             if (connector != null)
             {
                 connector.CurrentCopyOperation = null;
+                _connector.Connection?.EndBindingScope(ConnectorBindingScope.Copy);
                 _connector = null;
             }
 

@@ -30,8 +30,8 @@ namespace Npgsql.Tests
                 {
                     ApplicationName = "App" + i
                 }.ToString();
-                using (var conn = new NpgsqlConnection(connString))
-                    conn.Open();
+                using var conn = new NpgsqlConnection(connString);
+                conn.Open();
             }
             PoolManager.Reset();
         }
@@ -43,11 +43,11 @@ namespace Npgsql.Tests
             using (OpenConnection()) {}
             // Now have one connection in the pool
             Assert.That(PoolManager.TryGetValue(ConnectionString, out var pool), Is.True);
-            Assert.That(pool!.State.Idle, Is.EqualTo(1));
+            Assert.That(pool!.Statistics.Idle, Is.EqualTo(1));
 
             NpgsqlConnection.ClearAllPools();
-            Assert.That(pool.State.Idle, Is.Zero);
-            Assert.That(pool.State.Open, Is.Zero);
+            Assert.That(pool.Statistics.Idle, Is.Zero);
+            Assert.That(pool.Statistics.Total, Is.Zero);
         }
 
         [Test]
@@ -61,11 +61,11 @@ namespace Npgsql.Tests
 
                 NpgsqlConnection.ClearAllPools();
                 Assert.That(PoolManager.TryGetValue(ConnectionString, out pool), Is.True);
-                Assert.That(pool!.State.Idle, Is.Zero);
-                Assert.That(pool.State.Open, Is.EqualTo(1));
+                Assert.That(pool!.Statistics.Idle, Is.Zero);
+                Assert.That(pool.Statistics.Total, Is.EqualTo(1));
             }
-            Assert.That(pool.State.Idle, Is.Zero);
-            Assert.That(pool.State.Open, Is.Zero);
+            Assert.That(pool.Statistics.Idle, Is.Zero);
+            Assert.That(pool.Statistics.Total, Is.Zero);
         }
 
         [SetUp]

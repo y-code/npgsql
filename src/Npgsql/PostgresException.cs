@@ -1,12 +1,9 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Runtime.Serialization;
 using System.Text;
-using JetBrains.Annotations;
 using Npgsql.BackendMessages;
-
-#pragma warning disable CA1032
+using Npgsql.Internal;
 
 namespace Npgsql
 {
@@ -16,62 +13,101 @@ namespace Npgsql
     /// </summary>
     /// <remarks>
     /// This exception only corresponds to a PostgreSQL-delivered error.
-    /// Other errors (e.g. network issues) will be raised via <see cref="NpgsqlException"/>,
+    /// Other errors (e.g. network issues) will be raised via <see cref="NpgsqlException" />,
     /// and purely Npgsql-related issues which aren't related to the server will be raised
-    /// via the standard CLR exceptions (e.g. ArgumentException).
+    /// via the standard CLR exceptions (e.g. <see cref="ArgumentException" />).
     ///
-    /// See http://www.postgresql.org/docs/current/static/errcodes-appendix.html,
-    /// http://www.postgresql.org/docs/current/static/protocol-error-fields.html
+    /// See https://www.postgresql.org/docs/current/static/errcodes-appendix.html,
+    /// https://www.postgresql.org/docs/current/static/protocol-error-fields.html
     /// </remarks>
     [Serializable]
     public sealed class PostgresException : NpgsqlException
     {
-        bool _dataInitialized;
-
-        /// <summary>
-        /// Creates a new instance.
-        /// </summary>
-        /// <remarks>
-        /// Exists for backwards compat with 4.0, has been removed for 5.0.
-        /// </remarks>
-        [Obsolete]
-        public PostgresException() : this(string.Empty, string.Empty, string.Empty, string.Empty) {}
-
         /// <summary>
         /// Creates a new instance.
         /// </summary>
         public PostgresException(string messageText, string severity, string invariantSeverity, string sqlState)
+            : this(messageText, severity, invariantSeverity, sqlState, detail: null) {}
+
+        /// <summary>
+        /// Creates a new instance.
+        /// </summary>
+        public PostgresException(
+            string messageText, string severity, string invariantSeverity, string sqlState,
+            string? detail = null, string? hint = null, int position = 0, int internalPosition = 0,
+            string? internalQuery = null, string? where = null, string? schemaName = null, string? tableName = null,
+            string? columnName = null, string? dataTypeName = null, string? constraintName = null, string? file = null,
+            string? line = null, string? routine = null)
+            : base(GetMessage(sqlState, messageText, position, detail))
         {
             MessageText = messageText;
             Severity = severity;
             InvariantSeverity = invariantSeverity;
             SqlState = sqlState;
+
+            Detail = detail;
+            Hint = hint;
+            Position = position;
+            InternalPosition = internalPosition;
+            InternalQuery = internalQuery;
+            Where = where;
+            SchemaName = schemaName;
+            TableName = tableName;
+            ColumnName = columnName;
+            DataTypeName = dataTypeName;
+            ConstraintName = constraintName;
+            File = file;
+            Line = line;
+            Routine = routine;
+
+            AddData(nameof(Severity), Severity);
+            AddData(nameof(InvariantSeverity), InvariantSeverity);
+            AddData(nameof(SqlState), SqlState);
+            AddData(nameof(MessageText), MessageText);
+            AddData(nameof(Detail), Detail);
+            AddData(nameof(Hint), Hint);
+            AddData(nameof(Position), Position);
+            AddData(nameof(InternalPosition), InternalPosition);
+            AddData(nameof(InternalQuery), InternalQuery);
+            AddData(nameof(Where), Where);
+            AddData(nameof(SchemaName), SchemaName);
+            AddData(nameof(TableName), TableName);
+            AddData(nameof(ColumnName), ColumnName);
+            AddData(nameof(DataTypeName), DataTypeName);
+            AddData(nameof(ConstraintName), ConstraintName);
+            AddData(nameof(File), File);
+            AddData(nameof(Line), Line);
+            AddData(nameof(Routine), Routine);
+
+            void AddData<T>(string key, T value)
+            {
+                if (!EqualityComparer<T>.Default.Equals(value, default!))
+                    Data.Add(key, value);
+            }
         }
+
+        static string GetMessage(string sqlState, string messageText, int position, string? detail)
+        {
+            var baseMessage = sqlState + ": " + messageText;
+            var additionalMessage =
+                TryAddString("POSITION", position == 0 ? null : position.ToString()) +
+                TryAddString("DETAIL", detail);
+            return string.IsNullOrEmpty(additionalMessage)
+                ? baseMessage
+                : baseMessage + Environment.NewLine + additionalMessage;
+        }
+
+        static string TryAddString(string text, string? value) => !string.IsNullOrWhiteSpace(value) ? $"{Environment.NewLine}{text}: {value}" : string.Empty;
 
         PostgresException(ErrorOrNoticeMessage msg)
-        {
-            Severity = msg.Severity;
-            InvariantSeverity = msg.InvariantSeverity;
-            SqlState = msg.Code;
-            MessageText = msg.Message;
-            Detail = msg.Detail;
-            Hint = msg.Hint;
-            Position = msg.Position;
-            InternalPosition = msg.InternalPosition;
-            InternalQuery = msg.InternalQuery;
-            Where = msg.Where;
-            SchemaName = msg.SchemaName;
-            TableName = msg.TableName;
-            ColumnName = msg.ColumnName;
-            DataTypeName = msg.DataTypeName;
-            ConstraintName = msg.ConstraintName;
-            File = msg.File;
-            Line = msg.Line;
-            Routine = msg.Routine;
-        }
+            : this(
+                msg.Message, msg.Severity, msg.InvariantSeverity, msg.SqlState,
+                msg.Detail, msg.Hint, msg.Position, msg.InternalPosition, msg.InternalQuery,
+                msg.Where, msg.SchemaName, msg.TableName, msg.ColumnName, msg.DataTypeName,
+                msg.ConstraintName, msg.File, msg.Line, msg.Routine) {}
 
-        internal static PostgresException Load(NpgsqlReadBuffer buf)
-            => new PostgresException(ErrorOrNoticeMessage.Load(buf));
+        internal static PostgresException Load(NpgsqlReadBuffer buf, bool includeDetail)
+            => new(ErrorOrNoticeMessage.Load(buf, includeDetail));
 
         internal PostgresException(SerializationInfo info, StreamingContext context)
             : base(info, context)
@@ -160,12 +196,7 @@ namespace Npgsql
         }
 
         /// <summary>
-        /// Gets a the PostgreSQL error message and code.
-        /// </summary>
-        public override string Message => SqlState + ": " + MessageText;
-
-        /// <summary>
-        /// Specifies whether the exception is considered transient, that is, whether retrying to operation could
+        /// Specifies whether the exception is considered transient, that is, whether retrying the operation could
         /// succeed (e.g. a network error). Check <see cref="SqlState"/>.
         /// </summary>
         public override bool IsTransient
@@ -204,61 +235,18 @@ namespace Npgsql
         /// </summary>
         public NpgsqlStatement? Statement { get; internal set; }
 
-        /// <summary>
-        /// Gets a collection of key/value pairs that provide additional PostgreSQL fields about the exception.
-        /// </summary>
-        public override IDictionary Data
-        {
-            get
-            {
-                var data = base.Data;
-                if (_dataInitialized)
-                    return data;
-
-                AddData(nameof(Severity), Severity);
-                AddData(nameof(InvariantSeverity), InvariantSeverity);
-                AddData(nameof(SqlState), SqlState);
-                AddData(nameof(MessageText), MessageText);
-                AddData(nameof(Detail), Detail);
-                AddData(nameof(Hint), Hint);
-                AddData(nameof(Position), Position);
-                AddData(nameof(InternalPosition), InternalPosition);
-                AddData(nameof(InternalQuery), InternalQuery);
-                AddData(nameof(Where), Where);
-                AddData(nameof(SchemaName), SchemaName);
-                AddData(nameof(TableName), TableName);
-                AddData(nameof(ColumnName), ColumnName);
-                AddData(nameof(DataTypeName), DataTypeName);
-                AddData(nameof(ConstraintName), ConstraintName);
-                AddData(nameof(File), File);
-                AddData(nameof(Line), Line);
-                AddData(nameof(Routine), Routine);
-
-                _dataInitialized = true;
-                return data;
-
-                void AddData<T>(string key, T value)
-                {
-                    if (!EqualityComparer<T>.Default.Equals(value, default!))
-                        data.Add(key, value);
-                }
-            }
-        }
-
         #region Message Fields
 
         /// <summary>
         /// Severity of the error or notice.
         /// Always present.
         /// </summary>
-        [PublicAPI]
         public string Severity { get; }
 
         /// <summary>
         /// Severity of the error or notice, not localized.
         /// Always present since PostgreSQL 9.6.
         /// </summary>
-        [PublicAPI]
         public string InvariantSeverity { get; }
 
         /// <summary>
@@ -267,10 +255,13 @@ namespace Npgsql
         /// <remarks>
         /// Always present.
         /// Constants are defined in <seealso cref="PostgresErrorCodes"/>.
-        /// See http://www.postgresql.org/docs/current/static/errcodes-appendix.html
+        /// See https://www.postgresql.org/docs/current/static/errcodes-appendix.html
         /// </remarks>
-        [PublicAPI]
+#if NET
+        public override string SqlState { get; }
+#else
         public string SqlState { get; }
+#endif
 
         /// <summary>
         /// The SQLSTATE code for the error.
@@ -278,9 +269,9 @@ namespace Npgsql
         /// <remarks>
         /// Always present.
         /// Constants are defined in <seealso cref="PostgresErrorCodes"/>.
-        /// See http://www.postgresql.org/docs/current/static/errcodes-appendix.html
+        /// See https://www.postgresql.org/docs/current/static/errcodes-appendix.html
         /// </remarks>
-        [PublicAPI, Obsolete("Use SqlState instead")]
+        [Obsolete("Use SqlState instead")]
         public string Code => SqlState;
 
         /// <summary>
@@ -289,14 +280,12 @@ namespace Npgsql
         /// <remarks>
         /// Always present.
         /// </remarks>
-        [PublicAPI]
         public string MessageText { get; }
 
         /// <summary>
         /// An optional secondary error message carrying more detail about the problem.
         /// May run to multiple lines.
         /// </summary>
-        [PublicAPI]
         public string? Detail { get; }
 
         /// <summary>
@@ -304,7 +293,6 @@ namespace Npgsql
         /// This is intended to differ from Detail in that it offers advice (potentially inappropriate) rather than hard facts.
         /// May run to multiple lines.
         /// </summary>
-        [PublicAPI]
         public string? Hint { get; }
 
         /// <summary>
@@ -312,7 +300,6 @@ namespace Npgsql
         /// The first character has index 1, and positions are measured in characters not bytes.
         /// 0 means not provided.
         /// </summary>
-        [PublicAPI]
         public int Position { get; }
 
         /// <summary>
@@ -320,14 +307,12 @@ namespace Npgsql
         /// The <see cref="InternalQuery" /> field will always appear when this field appears.
         /// 0 means not provided.
         /// </summary>
-        [PublicAPI]
         public int InternalPosition { get; }
 
         /// <summary>
         /// The text of a failed internally-generated command.
         /// This could be, for example, a SQL query issued by a PL/pgSQL function.
         /// </summary>
-        [PublicAPI]
         public string? InternalQuery { get; }
 
         /// <summary>
@@ -335,14 +320,12 @@ namespace Npgsql
         /// Presently this includes a call stack traceback of active PL functions.
         /// The trace is one entry per line, most recent first.
         /// </summary>
-        [PublicAPI]
         public string? Where { get; }
 
         /// <summary>
         /// If the error was associated with a specific database object, the name of the schema containing that object, if any.
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? SchemaName { get; }
 
         /// <summary>
@@ -350,7 +333,6 @@ namespace Npgsql
         /// (Refer to the schema name field for the name of the table's schema.)
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? TableName { get; }
 
         /// <summary>
@@ -358,7 +340,6 @@ namespace Npgsql
         /// (Refer to the schema and table name fields to identify the table.)
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? ColumnName { get; }
 
         /// <summary>
@@ -366,7 +347,6 @@ namespace Npgsql
         /// (Refer to the schema name field for the name of the data type's schema.)
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? DataTypeName { get; }
 
         /// <summary>
@@ -375,26 +355,22 @@ namespace Npgsql
         /// (For this purpose, indexes are treated as constraints, even if they weren't created with constraint syntax.)
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? ConstraintName { get; }
 
         /// <summary>
         /// The file name of the source-code location where the error was reported.
         /// </summary>
         /// <remarks>PostgreSQL 9.3 and up.</remarks>
-        [PublicAPI]
         public string? File { get; }
 
         /// <summary>
         /// The line number of the source-code location where the error was reported.
         /// </summary>
-        [PublicAPI]
         public string? Line { get; }
 
         /// <summary>
         /// The name of the source-code routine reporting the error.
         /// </summary>
-        [PublicAPI]
         public string? Routine { get; }
 
         #endregion

@@ -8,7 +8,7 @@ namespace Npgsql
     ///
     /// Instances aren't constructed directly; users should construct an <see cref="NpgsqlCommand"/>
     /// object and populate its <see cref="NpgsqlCommand.CommandText"/> property as in standard ADO.NET.
-    /// Npgsql will analyze that property and constructed instances of <see cref="NpgsqlStatement"/>
+    /// Npgsql will analyze that property and construct instances of <see cref="NpgsqlStatement"/>
     /// internally.
     ///
     /// Users can retrieve instances from <see cref="NpgsqlDataReader.Statements"/>
@@ -31,9 +31,18 @@ namespace Npgsql
         /// </summary>
         /// <remarks>
         /// See the command tag in the CommandComplete message,
-        /// http://www.postgresql.org/docs/current/static/protocol-message-formats.html
+        /// https://www.postgresql.org/docs/current/static/protocol-message-formats.html
         /// </remarks>
-        public uint Rows { get; internal set; }
+        public uint Rows => (uint)LongRows;
+
+        /// <summary>
+        /// The number of rows affected or retrieved.
+        /// </summary>
+        /// <remarks>
+        /// See the command tag in the CommandComplete message,
+        /// https://www.postgresql.org/docs/current/static/protocol-message-formats.html
+        /// </remarks>
+        public ulong LongRows { get; internal set; }
 
         /// <summary>
         /// For an INSERT, the object ID of the inserted row if <see cref="Rows"/> is 1 and
@@ -44,7 +53,7 @@ namespace Npgsql
         /// <summary>
         /// The input parameters sent with this statement.
         /// </summary>
-        public List<NpgsqlParameter> InputParameters { get; } = new List<NpgsqlParameter>();
+        public List<NpgsqlParameter> InputParameters { get; } = new();
 
         /// <summary>
         /// The RowDescription message for this query. If null, the query does not return rows (e.g. INSERT)
@@ -77,6 +86,8 @@ namespace Npgsql
 
         PreparedStatement? _preparedStatement;
 
+        internal bool IsPreparing;
+
         /// <summary>
         /// Holds the server-side (prepared) statement name. Empty string for non-prepared statements.
         /// </summary>
@@ -92,7 +103,7 @@ namespace Npgsql
             SQL = string.Empty;
             StatementType = StatementType.Select;
             _description = null;
-            Rows = 0;
+            LongRows = 0;
             OID = 0;
             InputParameters.Clear();
             PreparedStatement = null;
@@ -101,8 +112,7 @@ namespace Npgsql
         internal void ApplyCommandComplete(CommandCompleteMessage msg)
         {
             StatementType = msg.StatementType;
-            // Downcast to uint for backwards compat with 4.0
-            Rows = (uint)msg.Rows;
+            LongRows = msg.Rows;
             OID = msg.OID;
         }
 

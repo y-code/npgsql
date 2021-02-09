@@ -1,12 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Diagnostics;
+using System.Data;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Transactions;
 using Npgsql.BackendMessages;
-using Npgsql.TypeHandlers;
-using Npgsql.TypeHandlers.CompositeHandlers;
+using Npgsql.Internal.TypeHandlers;
+using Npgsql.Internal.TypeHandlers.CompositeHandlers;
 using Npgsql.Util;
 
 namespace Npgsql.Schema
@@ -27,9 +29,6 @@ namespace Npgsql.Schema
         #region Columns queries
 
         static string GenerateColumnsQuery(Version pgVersion, string columnFieldFilter) =>
-            pgVersion < new Version(8, 2)
-                ? GenerateOldColumnsQuery(columnFieldFilter)
-                :
 $@"SELECT
      typ.oid AS typoid, nspname, relname, attname, attrelid, attnum, attnotnull,
      {(pgVersion >= new Version(10, 0) ? "attidentity != ''" : "FALSE")} AS isidentity,
@@ -46,7 +45,7 @@ $@"SELECT
        SELECT * FROM pg_index
        WHERE pg_index.indrelid = cls.oid AND
              pg_index.indisunique AND
-             pg_index.{(pgVersion >= new Version(11, 0) ? "indnkeyatts" : "indnatts")} = 1 AND 
+             pg_index.{(pgVersion >= new Version(11, 0) ? "indnkeyatts" : "indnatts")} = 1 AND
              attnum = pg_index.indkey[0]
      ) AS isunique
 FROM pg_attribute AS attr
@@ -94,8 +93,11 @@ ORDER BY attnum";
 
         #endregion Column queries
 
-        internal ReadOnlyCollection<NpgsqlDbColumn> GetColumnSchema()
+        internal async Task<ReadOnlyCollection<NpgsqlDbColumn>> GetColumnSchema(bool async, CancellationToken cancellationToken = default)
         {
+            // This is mainly for Amazon Redshift
+            var oldQueryMode = _connection.PostgreSqlVersion < new Version(8, 2);
+
             var fields = _rowDescription.Fields;
             var result = new List<NpgsqlDbColumn?>(fields.Count);
             for (var i = 0; i < fields.Count; i++)
@@ -113,24 +115,37 @@ ORDER BY attnum";
 
             if (_fetchAdditionalInfo && columnFieldFilter != "")
             {
-                var query = GenerateColumnsQuery(_connection.PostgreSqlVersion, columnFieldFilter);
+                var query = oldQueryMode
+                    ? GenerateOldColumnsQuery(columnFieldFilter)
+                    : GenerateColumnsQuery(_connection.PostgreSqlVersion, columnFieldFilter);
 
-                using (new TransactionScope(TransactionScopeOption.Suppress))
-                using (var connection = (NpgsqlConnection)((ICloneable)_connection).Clone())
+                using var scope = new TransactionScope(
+                    TransactionScopeOption.Suppress,
+                    async ? TransactionScopeAsyncFlowOption.Enabled : TransactionScopeAsyncFlowOption.Suppress);
+                using var connection = (NpgsqlConnection)((ICloneable)_connection).Clone();
+
+                await connection.Open(async, cancellationToken);
+
+                using var cmd = new NpgsqlCommand(query, connection);
+                using var reader = await cmd.ExecuteReader(CommandBehavior.Default, async, cancellationToken);
+                while (async ? await reader.ReadAsync(cancellationToken): reader.Read())
                 {
-                    connection.Open();
-
-                    using var cmd = new NpgsqlCommand(query, connection);
-                    using var reader = cmd.ExecuteReader();
-                    for (; reader.Read(); populatedColumns++)
+                    var column = LoadColumnDefinition(reader, _connection.Connector!.TypeMapper.DatabaseInfo, oldQueryMode);
+                    for (var ordinal = 0; ordinal < fields.Count; ordinal++)
                     {
-                        var column = LoadColumnDefinition(reader, _connection.Connector!.TypeMapper.DatabaseInfo);
-                        var ordinal = fields.FindIndex(f => f.TableOID == column.TableOID && f.ColumnAttributeNumber - 1 == column.ColumnAttributeNumber);
-                        Debug.Assert(ordinal >= 0);
+                        var field = fields[ordinal];
+                        if (field.TableOID == column.TableOID &&
+                            field.ColumnAttributeNumber == column.ColumnAttributeNumber)
+                        {
+                            populatedColumns++;
 
-                        // The column's ordinal is with respect to the resultset, not its table
-                        column.ColumnOrdinal = ordinal;
-                        result[ordinal] = column;
+                            if (column.ColumnOrdinal.HasValue)
+                                column = column.Clone();
+
+                            // The column's ordinal is with respect to the resultset, not its table
+                            column.ColumnOrdinal = ordinal;
+                            result[ordinal] = column;
+                        }
                     }
                 }
             }
@@ -139,10 +154,10 @@ ORDER BY attnum";
             // Fill in whatever info we have from the RowDescription itself
             for (var i = 0; i < fields.Count; i++)
             {
-                NpgsqlDbColumn column;
+                var column = result[i];
                 var field = fields[i];
 
-                if (result[i] == null)
+                if (column is null)
                 {
                     column = SetUpNonColumnField(field);
                     column.ColumnOrdinal = i;
@@ -150,7 +165,8 @@ ORDER BY attnum";
                     populatedColumns++;
                 }
 
-                result[i]!.ColumnName = result[i]!.BaseColumnName = field.Name.StartsWith("?column?") ? null : field.Name;
+                column.ColumnName = field.Name;
+                column.IsAliased = column.BaseColumnName is null ? default(bool?) : (column.BaseColumnName != column.ColumnName);
             }
 
             if (populatedColumns != fields.Count)
@@ -159,11 +175,10 @@ ORDER BY attnum";
             return result.AsReadOnly()!;
         }
 
-        NpgsqlDbColumn LoadColumnDefinition(NpgsqlDataReader reader, NpgsqlDatabaseInfo databaseInfo)
+        NpgsqlDbColumn LoadColumnDefinition(NpgsqlDataReader reader, NpgsqlDatabaseInfo databaseInfo, bool oldQueryMode)
         {
-            // Note: we don't set ColumnName and BaseColumnName. These should always contain the
-            // column alias rather than the table column name (i.e. in case of "SELECT foo AS foo_alias").
-            // It will be set later.
+            // We don't set ColumnName here. It should always contain the column alias rather than
+            // the table column name (i.e. in case of "SELECT foo AS foo_alias"). It will be set later.
             var column = new NpgsqlDbColumn
             {
                 AllowDBNull = !reader.GetBoolean(reader.GetOrdinal("attnotnull")),
@@ -171,8 +186,8 @@ ORDER BY attnum";
                 BaseSchemaName = reader.GetString(reader.GetOrdinal("nspname")),
                 BaseServerName = _connection.Host!,
                 BaseTableName = reader.GetString(reader.GetOrdinal("relname")),
-                ColumnOrdinal = reader.GetInt32(reader.GetOrdinal("attnum")) - 1,
-                ColumnAttributeNumber = (short)(reader.GetInt16(reader.GetOrdinal("attnum")) - 1),
+                BaseColumnName = reader.GetString(reader.GetOrdinal("attname")),
+                ColumnAttributeNumber = reader.GetInt16(reader.GetOrdinal("attnum")),
                 IsKey = reader.GetBoolean(reader.GetOrdinal("isprimarykey")),
                 IsReadOnly = !reader.GetBoolean(reader.GetOrdinal("is_updatable")),
                 IsUnique = reader.GetBoolean(reader.GetOrdinal("isunique")),
@@ -187,7 +202,8 @@ ORDER BY attnum";
             var defaultValueOrdinal = reader.GetOrdinal("default");
             column.DefaultValue = reader.IsDBNull(defaultValueOrdinal) ? null : reader.GetString(defaultValueOrdinal);
 
-            column.IsAutoIncrement = reader.GetBoolean(reader.GetOrdinal("isidentity")) ||
+            column.IsAutoIncrement =
+                !oldQueryMode && reader.GetBoolean(reader.GetOrdinal("isidentity")) ||
                 column.DefaultValue != null && column.DefaultValue.StartsWith("nextval(");
 
             ColumnPostConfig(column, reader.GetInt32(reader.GetOrdinal("typmod")));
@@ -222,15 +238,7 @@ ORDER BY attnum";
         {
             var typeMapper = _connection.Connector!.TypeMapper;
 
-            if (typeMapper.Mappings.TryGetValue(column.PostgresType.Name, out var mapping))
-                column.NpgsqlDbType = mapping.NpgsqlDbType;
-            else if (
-                column.PostgresType.Name.Contains(".") &&
-                typeMapper.Mappings.TryGetValue(column.PostgresType.Name.Split('.')[1], out mapping)
-            ) {
-                column.NpgsqlDbType = mapping.NpgsqlDbType;
-            }
-
+            column.NpgsqlDbType = typeMapper.GetTypeInfoByOid(column.TypeOID).npgsqlDbType;
             column.DataType = typeMapper.TryGetByOID(column.TypeOID, out var handler)
                 ? handler.GetFieldType()
                 : null;
@@ -239,7 +247,7 @@ ORDER BY attnum";
             {
                 column.IsLong = handler is ByteaHandler;
 
-                if (handler is IMappedCompositeHandler)
+                if (handler is ICompositeHandler)
                     column.UdtAssemblyQualifiedName = column.DataType.AssemblyQualifiedName;
             }
 

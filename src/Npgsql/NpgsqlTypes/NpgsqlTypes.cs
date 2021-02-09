@@ -18,11 +18,11 @@ namespace NpgsqlTypes
     /// Represents a PostgreSQL point type.
     /// </summary>
     /// <remarks>
-    /// See http://www.postgresql.org/docs/current/static/datatype-geometric.html
+    /// See https://www.postgresql.org/docs/current/static/datatype-geometric.html
     /// </remarks>
     public struct NpgsqlPoint : IEquatable<NpgsqlPoint>
     {
-        static readonly Regex Regex = new Regex(@"\((-?\d+.?\d*),(-?\d+.?\d*)\)");
+        static readonly Regex Regex = new(@"\((-?\d+.?\d*),(-?\d+.?\d*)\)");
 
         public double X { get; set; }
         public double Y { get; set; }
@@ -66,11 +66,11 @@ namespace NpgsqlTypes
     /// Represents a PostgreSQL line type.
     /// </summary>
     /// <remarks>
-    /// See http://www.postgresql.org/docs/current/static/datatype-geometric.html
+    /// See https://www.postgresql.org/docs/current/static/datatype-geometric.html
     /// </remarks>
     public struct NpgsqlLine : IEquatable<NpgsqlLine>
     {
-        static readonly Regex Regex = new Regex(@"\{(-?\d+.?\d*),(-?\d+.?\d*),(-?\d+.?\d*)\}");
+        static readonly Regex Regex = new(@"\{(-?\d+.?\d*),(-?\d+.?\d*),(-?\d+.?\d*)\}");
 
         public double A { get; set; }
         public double B { get; set; }
@@ -115,7 +115,7 @@ namespace NpgsqlTypes
     /// </summary>
     public struct NpgsqlLSeg : IEquatable<NpgsqlLSeg>
     {
-        static readonly Regex Regex = new Regex(@"\[\((-?\d+.?\d*),(-?\d+.?\d*)\),\((-?\d+.?\d*),(-?\d+.?\d*)\)\]");
+        static readonly Regex Regex = new(@"\[\((-?\d+.?\d*),(-?\d+.?\d*)\),\((-?\d+.?\d*),(-?\d+.?\d*)\)\]");
 
         public NpgsqlPoint Start { get; set; }
         public NpgsqlPoint End { get; set; }
@@ -170,11 +170,11 @@ namespace NpgsqlTypes
     /// Represents a PostgreSQL box type.
     /// </summary>
     /// <remarks>
-    /// See http://www.postgresql.org/docs/current/static/datatype-geometric.html
+    /// See https://www.postgresql.org/docs/current/static/datatype-geometric.html
     /// </remarks>
     public struct NpgsqlBox : IEquatable<NpgsqlBox>
     {
-        static readonly Regex Regex = new Regex(@"\((-?\d+.?\d*),(-?\d+.?\d*)\),\((-?\d+.?\d*),(-?\d+.?\d*)\)");
+        static readonly Regex Regex = new(@"\((-?\d+.?\d*),(-?\d+.?\d*)\),\((-?\d+.?\d*),(-?\d+.?\d*)\)");
 
         public NpgsqlPoint UpperRight { get; set; }
         public NpgsqlPoint LowerLeft { get; set; }
@@ -456,7 +456,7 @@ namespace NpgsqlTypes
     /// </summary>
     public struct NpgsqlCircle : IEquatable<NpgsqlCircle>
     {
-        static readonly Regex Regex = new Regex(@"<\((-?\d+.?\d*),(-?\d+.?\d*)\),(\d+.?\d*)>");
+        static readonly Regex Regex = new(@"<\((-?\d+.?\d*),(-?\d+.?\d*)\),(\d+.?\d*)>");
 
         public double X { get; set; }
         public double Y { get; set; }
@@ -479,7 +479,7 @@ namespace NpgsqlTypes
 
         public NpgsqlPoint Center
         {
-            get => new NpgsqlPoint(X, Y);
+            get => new(X, Y);
             set
             {
                 X = value.X;
@@ -523,7 +523,7 @@ namespace NpgsqlTypes
     /// subnet mask.
     /// </summary>
     /// <remarks>
-    /// http://www.postgresql.org/docs/current/static/datatype-net-types.html
+    /// https://www.postgresql.org/docs/current/static/datatype-net-types.html
     /// </remarks>
     [Obsolete("Use ValueTuple<IPAddress, int> instead")]
     public struct NpgsqlInet : IEquatable<NpgsqlInet>
@@ -615,7 +615,7 @@ namespace NpgsqlTypes
     /// Represents a PostgreSQL tid value
     /// </summary>
     /// <remarks>
-    /// http://www.postgresql.org/docs/current/static/datatype-oid.html
+    /// https://www.postgresql.org/docs/current/static/datatype-oid.html
     /// </remarks>
     public readonly struct NpgsqlTid : IEquatable<NpgsqlTid>
     {

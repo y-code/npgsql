@@ -10,7 +10,7 @@ namespace Npgsql
         internal int MaxAutoPrepared { get; }
         internal int UsagesBeforePrepare { get; }
 
-        internal Dictionary<string, PreparedStatement> BySql { get; } = new Dictionary<string, PreparedStatement>();
+        internal Dictionary<string, PreparedStatement> BySql { get; } = new();
         readonly PreparedStatement[] _autoPrepared;
         int _numAutoPrepared;
 
@@ -78,8 +78,6 @@ namespace Npgsql
                     // The statement has already been autoprepared. We need to "promote" it to explicit.
                     statementBeingReplaced = pStatement;
                     break;
-                case PreparedState.BeingPrepared:
-                    throw new InvalidOperationException($"Found autoprepare statement in state {nameof(PreparedState.BeingPrepared)}");
                 case PreparedState.Unprepared:
                     throw new InvalidOperationException($"Found unprepared statement in {nameof(PreparedStatementManager)}");
                 default:
@@ -132,15 +130,28 @@ namespace Npgsql
 
             switch (pStatement.State)
             {
-                case PreparedState.Prepared:
-                case PreparedState.ToBePrepared:
+            case PreparedState.NotPrepared:
+                break;
+
+            case PreparedState.Prepared:
+            case PreparedState.BeingPrepared:
                 // The statement has already been prepared (explicitly or automatically), or has been selected
                 // for preparation (earlier identical statement in the same command).
                 // We just need to check that the parameter types correspond, since prepared statements are
                 // only keyed by SQL (to prevent pointless allocations). If we have a mismatch, simply run unprepared.
-                return pStatement.DoParametersMatch(statement.InputParameters)
-                    ? pStatement
-                    : null;
+                if (!pStatement.DoParametersMatch(statement.InputParameters))
+                    return null;
+                // Prevent this statement from being replaced within this batch
+                pStatement.LastUsed = DateTime.MaxValue;
+                return pStatement;
+
+            case PreparedState.BeingUnprepared:
+                // The statement is being replaced by an earlier statement in this same batch.
+                return null;
+
+            default:
+                Debug.Fail($"Unexpected {nameof(PreparedState)} in auto-preparation: {pStatement.State}");
+                break;
             }
 
             if (++pStatement.Usages < UsagesBeforePrepare)
@@ -153,9 +164,6 @@ namespace Npgsql
 
             // Bingo, we've just passed the usage threshold, statement should get prepared
             Log.Trace($"Automatically preparing statement: {sql}", _connector.Id);
-            pStatement.State = PreparedState.ToBePrepared;
-
-            RemoveCandidate(pStatement);
 
             if (_numAutoPrepared < MaxAutoPrepared)
             {
@@ -177,11 +185,25 @@ namespace Npgsql
                         oldestTimestamp = _autoPrepared[i].LastUsed;
                     }
                 }
+
+                if (oldestIndex == -1)
+                {
+                    // We're here if we couldn't find a prepared statement to replace, because all of them are already
+                    // being prepared in this batch.
+                    return null;
+                }
+
                 var lru = _autoPrepared[oldestIndex];
                 pStatement.Name = lru.Name;
                 pStatement.StatementBeingReplaced = lru;
+                lru.State = PreparedState.BeingUnprepared;
                 _autoPrepared[oldestIndex] = pStatement;
             }
+
+            RemoveCandidate(pStatement);
+
+            // Make sure this statement isn't replaced by a later statement in the same batch.
+            pStatement.LastUsed = DateTime.MaxValue;
 
             // Note that the parameter types are only set at the moment of preparation - in the candidate phase
             // there's no differentiation between overloaded statements, which are a pretty rare case, saving

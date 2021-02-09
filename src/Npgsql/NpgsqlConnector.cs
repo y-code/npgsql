@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -13,8 +14,10 @@ using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Npgsql.BackendMessages;
+using Npgsql.Internal;
 using Npgsql.Logging;
 using Npgsql.TypeMapping;
 using Npgsql.Util;
@@ -87,6 +90,8 @@ namespace Npgsql
         /// </summary>
         internal int BackendProcessId { get; private set; }
 
+        bool SupportsPostgresCancellation => BackendProcessId != 0;
+
         /// <summary>
         /// A unique ID identifying this connector, used for logging. Currently mapped to BackendProcessId
         /// </summary>
@@ -102,21 +107,13 @@ namespace Npgsql
         internal TransactionStatus TransactionStatus { get; set; }
 
         /// <summary>
-        /// The transaction currently in progress, if any.
+        /// A transaction object for this connector. Since only one transaction can be in progress at any given time,
+        /// this instance is recycled. To check whether a transaction is currently in progress on this connector,
+        /// see <see cref="TransactionStatus"/>.
         /// </summary>
-        /// <remarks>
-        /// <para>
-        /// Note that this doesn't mean a transaction request has actually been sent to the backend - for
-        /// efficiency we defer sending the request to the first query after BeginTransaction is called.
-        /// See <see cref="TransactionStatus"/> for the actual transaction status.
-        /// </para>
-        /// <para>
-        /// Also, the user can initiate a transaction in SQL (i.e. BEGIN), in which case there will be no
-        /// NpgsqlTransaction instance. As a result, never check <see cref="Transaction"/> to know whether
-        /// a transaction is in progress, check <see cref="TransactionStatus"/> instead.
-        /// </para>
-        /// </remarks>
         internal NpgsqlTransaction? Transaction { get; set; }
+
+        internal NpgsqlTransaction? UnboundTransaction { get; set; }
 
         /// <summary>
         /// The NpgsqlConnection that (currently) owns this connector. Null if the connector isn't
@@ -128,7 +125,7 @@ namespace Npgsql
         /// The number of messages that were prepended to the current message chain, but not yet sent.
         /// Note that this only tracks messages which produce a ReadyForQuery message
         /// </summary>
-        int _pendingPrependedResponses;
+        internal int PendingPrependedResponses { get; set; }
 
         internal NpgsqlDataReader? CurrentReader;
 
@@ -148,33 +145,57 @@ namespace Npgsql
         /// <summary>
         /// Holds all run-time parameters in raw, binary format for efficient handling without allocations.
         /// </summary>
-        readonly List<(byte[] Name, byte[] Value)> _rawParameters = new List<(byte[], byte[])>();
+        readonly List<(byte[] Name, byte[] Value)> _rawParameters = new();
+
+        /// <summary>
+        /// If this connector was broken, this contains the exception that caused the break.
+        /// </summary>
+        volatile Exception? _breakReason;
+
+        /// <summary>
+        /// Semaphore, used to synchronize DatabaseInfo between multiple connections, so it wouldn't be loaded in parallel.
+        /// </summary>
+        static readonly SemaphoreSlim DatabaseInfoSemaphore = new(1);
+
+        /// <summary>
+        /// <para>
+        /// Used by the pool to indicate that I/O is currently in progress on this connector, so that another write
+        /// isn't started concurrently. Note that since we have only one write loop, this is only ever usedto
+        /// protect against an over-capacity writes into a connector that's currently *asynchronously* writing.
+        /// </para>
+        /// <para>
+        /// It is guaranteed that the currently-executing
+        /// Specifically, reading may occur - and the connector may even be returned to the pool - before this is
+        /// released.
+        /// </para>
+        /// </summary>
+        internal volatile int MultiplexAsyncWritingLock;
+
+        /// <seealso cref="MultiplexAsyncWritingLock"/>
+        internal void FlagAsNotWritableForMultiplexing()
+        {
+            if (Settings.Multiplexing)
+            {
+                Debug.Assert(CommandsInFlightCount > 0 || IsBroken || IsClosed,
+                    $"About to mark multiplexing connector as non-writable, but {nameof(CommandsInFlightCount)} is {CommandsInFlightCount}");
+
+                Interlocked.Exchange(ref MultiplexAsyncWritingLock, 1);
+            }
+        }
+
+        /// <seealso cref="MultiplexAsyncWritingLock"/>
+        internal void FlagAsWritableForMultiplexing()
+        {
+            if (Settings.Multiplexing && Interlocked.CompareExchange(ref MultiplexAsyncWritingLock, 0, 1) != 1)
+                throw new Exception("Multiplexing lock was not taken when releasing. Please report a bug.");
+        }
 
         /// <summary>
         /// The timeout for reading messages that are part of the user's command
         /// (i.e. which aren't internal prepended commands).
         /// </summary>
+        /// <remarks>Precision is milliseconds</remarks>
         internal int UserTimeout { private get; set; }
-
-        int ReceiveTimeout
-        {
-            set
-            {
-                // TODO: Socket.ReceiveTimeout doesn't work for async.
-                if (value != _currentTimeout)
-                    _socket.ReceiveTimeout = _currentTimeout = value;
-            }
-        }
-
-        /// <summary>
-        /// Contains the current value of the socket's ReceiveTimeout, used to determine whether
-        /// we need to change it when commands are received.
-        /// </summary>
-        int _currentTimeout;
-
-        // This is used by NpgsqlCommand, but we place it on the connector because only one instance is needed
-        // at any one time (per connection).
-        internal SqlQueryParser SqlParser { get; }
 
         /// <summary>
         /// A lock that's taken while a user action is in progress, e.g. a command being executed.
@@ -198,14 +219,35 @@ namespace Npgsql
         /// </summary>
         NpgsqlCommand? _currentCommand;
 
+        bool _sendResetOnClose;
+
+        ConnectorPool? _pool;
+
         /// <summary>
-        /// If pooled, the pool index on which this connector will be returned to the pool.
+        /// Contains the UTC timestamp when this connector was opened, used to implement
+        /// <see cref="NpgsqlConnectionStringBuilder.ConnectionLifetime"/>.
         /// </summary>
-        internal int PoolIndex { get; set; } = int.MaxValue;
+        internal DateTime OpenTimestamp { get; private set; }
 
         internal int ClearCounter { get; set; }
 
+        volatile bool _postgresCancellationPerformed;
+        internal bool PostgresCancellationPerformed
+        {
+            get => _postgresCancellationPerformed;
+            private set => _postgresCancellationPerformed = value;
+        }
+
+        volatile bool _userCancellationRequested;
+        CancellationTokenRegistration _cancellationTokenRegistration;
+        internal bool UserCancellationRequested => _userCancellationRequested;
+        internal CancellationToken UserCancellationToken { get; set; }
+        internal bool AttemptPostgresCancellation { get; private set; }
+        static readonly TimeSpan _cancelImmediatelyTimeout = TimeSpan.FromMilliseconds(-1);
+
         static readonly NpgsqlLogger Log = NpgsqlLogManager.CreateLogger(nameof(NpgsqlConnector));
+
+        internal readonly Stopwatch QueryLogStopWatch = new();
 
         #endregion
 
@@ -214,6 +256,7 @@ namespace Npgsql
         /// <summary>
         /// The minimum timeout that can be set on internal commands such as COMMIT, ROLLBACK.
         /// </summary>
+        /// <remarks>Precision is seconds</remarks>
         internal const int MinimumInternalCommandTimeout = 3;
 
         #endregion
@@ -225,20 +268,23 @@ namespace Npgsql
         int _resetWithoutDeallocateResponseCount;
 
         // Backend
-        readonly CommandCompleteMessage      _commandCompleteMessage      = new CommandCompleteMessage();
-        readonly ReadyForQueryMessage        _readyForQueryMessage        = new ReadyForQueryMessage();
-        readonly ParameterDescriptionMessage _parameterDescriptionMessage = new ParameterDescriptionMessage();
-        readonly DataRowMessage              _dataRowMessage              = new DataRowMessage();
-        readonly RowDescriptionMessage       _rowDescriptionMessage       = new RowDescriptionMessage();
+        readonly CommandCompleteMessage      _commandCompleteMessage      = new();
+        readonly ReadyForQueryMessage        _readyForQueryMessage        = new();
+        readonly ParameterDescriptionMessage _parameterDescriptionMessage = new();
+        readonly DataRowMessage              _dataRowMessage              = new();
+        readonly RowDescriptionMessage       _rowDescriptionMessage       = new();
 
         // Since COPY is rarely used, allocate these lazily
         CopyInResponseMessage?  _copyInResponseMessage;
         CopyOutResponseMessage? _copyOutResponseMessage;
         CopyDataMessage?        _copyDataMessage;
+        CopyBothResponseMessage? _copyBothResponseMessage;
 
         #endregion
 
-        internal NpgsqlDataReader DataReader { get; }
+        internal NpgsqlDataReader DataReader { get; set; }
+
+        internal NpgsqlDataReader? UnboundDataReader { get; set; }
 
         #region Constructors
 
@@ -246,6 +292,7 @@ namespace Npgsql
             : this(connection.Settings, connection.OriginalConnectionString)
         {
             Connection = connection;
+            _pool = connection.Pool;
             Connection.Connector = this;
             ProvideClientCertificatesCallback = Connection.ProvideClientCertificatesCallback;
             UserCertificateValidationCallback = Connection.UserCertificateValidationCallback;
@@ -272,7 +319,7 @@ namespace Npgsql
             Settings = settings;
             ConnectionString = connectionString;
             PostgresParameters = new Dictionary<string, string>();
-            SqlParser = new SqlQueryParser();
+
             CancelLock = new object();
 
             _isKeepAliveEnabled = Settings.KeepAlive > 0;
@@ -286,6 +333,24 @@ namespace Npgsql
 
             // TODO: Not just for automatic preparation anymore...
             PreparedStatementManager = new PreparedStatementManager(this);
+
+            if (settings.Multiplexing)
+            {
+                // Note: It's OK for this channel to be unbounded: each command enqueued to it is accompanied by sending
+                // it to PostgreSQL. If we overload it, a TCP zero window will make us block on the networking side
+                // anyway.
+                // Note: the in-flight channel can probably be single-writer, but that doesn't actually do anything
+                // at this point. And we currently rely on being able to complete the channel at any point (from
+                // Break). We may want to revisit this if an optimized, SingleWriter implementation is introduced.
+                var commandsInFlightChannel = Channel.CreateUnbounded<NpgsqlCommand>(
+                    new UnboundedChannelOptions { SingleReader = true });
+                CommandsInFlightReader = commandsInFlightChannel.Reader;
+                CommandsInFlightWriter = commandsInFlightChannel.Writer;
+
+                // TODO: Properly implement this
+                if (_isKeepAliveEnabled)
+                    throw new NotImplementedException("Keepalive not yet implemented for multiplexing");
+            }
         }
 
         #endregion
@@ -294,12 +359,17 @@ namespace Npgsql
 
         string Host => Settings.Host!;
         int Port => Settings.Port;
+        string Database => Settings.Database!;
         string KerberosServiceName => Settings.KerberosServiceName;
         SslMode SslMode => Settings.SslMode;
         int ConnectionTimeout => Settings.Timeout;
         bool IntegratedSecurity => Settings.IntegratedSecurity;
         internal bool ConvertInfinityDateTime => Settings.ConvertInfinityDateTime;
 
+        /// <summary>
+        /// The actual command timeout value that gets set on internal commands.
+        /// </summary>
+        /// <remarks>Precision is milliseconds</remarks>
         int InternalCommandTimeout
         {
             get
@@ -308,6 +378,9 @@ namespace Npgsql
                 if (internalTimeout == -1)
                     return Math.Max(Settings.CommandTimeout, MinimumInternalCommandTimeout) * 1000;
 
+                // Todo: Decide what we really want here
+                // This assertion can easily fail if InternalCommandTimeout is set to 1 or 2 in the connection string
+                // We probably don't want to allow these values but in that case a Debug.Assert is the wrong way to enforce it.
                 Debug.Assert(internalTimeout == 0 || internalTimeout >= MinimumInternalCommandTimeout);
                 return internalTimeout * 1000;
             }
@@ -340,22 +413,21 @@ namespace Npgsql
         bool IsConnected
             => State switch
             {
-                ConnectorState.Ready      => true,
-                ConnectorState.Executing  => true,
-                ConnectorState.Fetching   => true,
-                ConnectorState.Waiting    => true,
-                ConnectorState.Copy       => true,
-                ConnectorState.Closed     => false,
-                ConnectorState.Connecting => false,
-                ConnectorState.Broken     => false,
-                _                         => throw new ArgumentOutOfRangeException("Unknown state: " + State)
+                ConnectorState.Ready       => true,
+                ConnectorState.Executing   => true,
+                ConnectorState.Fetching    => true,
+                ConnectorState.Waiting     => true,
+                ConnectorState.Copy        => true,
+                ConnectorState.Replication => true,
+                ConnectorState.Closed      => false,
+                ConnectorState.Connecting  => false,
+                ConnectorState.Broken      => false,
+                _                          => throw new ArgumentOutOfRangeException("Unknown state: " + State)
             };
 
         internal bool IsReady => State == ConnectorState.Ready;
         internal bool IsClosed => State == ConnectorState.Closed;
         internal bool IsBroken => State == ConnectorState.Broken;
-
-        bool _isConnecting;
 
         #endregion
 
@@ -371,69 +443,124 @@ namespace Npgsql
             Debug.Assert(Connection != null && Connection.Connector == this);
             Debug.Assert(State == ConnectorState.Closed);
 
-            if (string.IsNullOrWhiteSpace(Host))
-                throw new ArgumentException("Host can't be null");
-
-            _isConnecting = true;
             State = ConnectorState.Connecting;
 
-            try {
+            try
+            {
                 await RawOpen(timeout, async, cancellationToken);
+
                 var username = GetUsername();
                 if (Settings.Database == null)
                     Settings.Database = username;
+
+                timeout.CheckAndApply(this);
                 WriteStartupMessage(username);
-                await Flush(async);
-                timeout.Check();
+                await Flush(async, cancellationToken);
 
-                await Authenticate(username, timeout, async);
-
-                // We treat BackendKeyData as optional because some PostgreSQL-like database
-                // don't send it (CockroachDB, CrateDB)
-                var msg = await ReadMessage(async);
-                if (msg.Code == BackendMessageCode.BackendKeyData)
+                using (StartCancellableOperation(cancellationToken, attemptPgCancellation: false))
                 {
-                    var keyDataMsg = (BackendKeyDataMessage)msg;
-                    BackendProcessId = keyDataMsg.BackendProcessId;
-                    _backendSecretKey = keyDataMsg.BackendSecretKey;
-                    msg = await ReadMessage(async);
+                    await Authenticate(username, timeout, async, cancellationToken);
+
+                    // We treat BackendKeyData as optional because some PostgreSQL-like database
+                    // don't send it (CockroachDB, CrateDB)
+                    var msg = await ReadMessage(async);
+                    if (msg.Code == BackendMessageCode.BackendKeyData)
+                    {
+                        var keyDataMsg = (BackendKeyDataMessage)msg;
+                        BackendProcessId = keyDataMsg.BackendProcessId;
+                        _backendSecretKey = keyDataMsg.BackendSecretKey;
+                        msg = await ReadMessage(async);
+                    }
+
+                    if (msg.Code != BackendMessageCode.ReadyForQuery)
+                        throw new NpgsqlException($"Received backend message {msg.Code} while expecting ReadyForQuery. Please file a bug.");
+
+                    State = ConnectorState.Ready;
                 }
-                if (msg.Code != BackendMessageCode.ReadyForQuery)
-                    throw new NpgsqlException($"Received backend message {msg.Code} while expecting ReadyForQuery. Please file a bug.");
 
-                State = ConnectorState.Ready;
+                await LoadDatabaseInfo(forceReload: false, timeout, async, cancellationToken);
 
-                await LoadDatabaseInfo(timeout, async);
-
-                if (Settings.Pooling && DatabaseInfo.SupportsDiscard)
+                if (Settings.Pooling && !Settings.Multiplexing && !Settings.NoResetOnClose && DatabaseInfo.SupportsDiscard)
+                {
+                    _sendResetOnClose = true;
                     GenerateResetMessage();
-                Counters.NumberOfNonPooledConnections.Increment();
-                Counters.HardConnectsPerSecond.Increment();
+                }
+
+                OpenTimestamp = DateTime.UtcNow;
                 Log.Trace($"Opened connection to {Host}:{Port}");
 
-                // If an exception occurs during open, Break() below shouldn't close the connection, which would also
-                // update pool state. Instead we let the exception propagate and get handled by the calling pool code.
-                // We use an extra state flag because the connector's State varies during the type loading query
-                // above (Executing, Fetching...). Note also that Break() gets called from ReadMessageLong().
-                _isConnecting = false;
+                if (Settings.Multiplexing)
+                {
+                    // Start an infinite async loop, which processes incoming multiplexing traffic.
+                    // It is intentionally not awaited and will run as long as the connector is alive.
+                    // The CommandsInFlightWriter channel is completed in Cleanup, which should cause this task
+                    // to complete.
+                    _ = Task.Run(MultiplexingReadLoop, CancellationToken.None)
+                        .ContinueWith(t =>
+                        {
+                            // Note that we *must* observe the exception if the task is faulted.
+                            Log.Error("Exception bubbled out of multiplexing read loop", t.Exception!, Id);
+                        }, TaskContinuationOptions.OnlyOnFaulted);
+                }
+
+                if (_isKeepAliveEnabled)
+                {
+                    // Start the keep alive mechanism to work by scheduling the timer.
+                    // Otherwise, it doesn't work for cases when no query executed during
+                    // the connection lifetime in case of a new connector.
+                    lock (this)
+                    {
+                        var keepAlive = Settings.KeepAlive * 1000;
+                        _keepAliveTimer!.Change(keepAlive, keepAlive);
+                    }
+                }
             }
-            catch
+            catch (Exception e)
             {
-                Break();
+                Break(e);
                 throw;
             }
         }
 
-        internal async Task LoadDatabaseInfo(NpgsqlTimeout timeout, bool async)
+        internal async ValueTask LoadDatabaseInfo(bool forceReload, NpgsqlTimeout timeout, bool async,
+            CancellationToken cancellationToken = default)
         {
+            // Super hacky stuff...
+
+            var prevBindingScope = Connection!.ConnectorBindingScope;
+            Connection.ConnectorBindingScope = ConnectorBindingScope.PhysicalConnecting;
+            using var _ = Defer(static (conn, prevScope) => conn.ConnectorBindingScope = prevScope, Connection, prevBindingScope);
+
             // The type loading below will need to send queries to the database, and that depends on a type mapper
             // being set up (even if its empty)
             TypeMapper = new ConnectorTypeMapper(this);
 
-            if (!NpgsqlDatabaseInfo.Cache.TryGetValue(ConnectionString, out var database))
-                NpgsqlDatabaseInfo.Cache[ConnectionString] = database = await NpgsqlDatabaseInfo.Load(Connection!, timeout, async);
+            var key = new NpgsqlDatabaseInfoCacheKey(Settings);
+            if (forceReload || !NpgsqlDatabaseInfo.Cache.TryGetValue(key, out var database))
+            {
+                var hasSemaphore = async
+                    ? await DatabaseInfoSemaphore.WaitAsync(timeout.TimeLeft, cancellationToken)
+                    : DatabaseInfoSemaphore.Wait(timeout.TimeLeft, cancellationToken);
 
-            DatabaseInfo = database;
+                // We've timed out - calling Check, to throw the correct exception
+                if (!hasSemaphore)
+                    timeout.Check();
+
+                try
+                {
+                    if (forceReload || !NpgsqlDatabaseInfo.Cache.TryGetValue(key, out database))
+                    {
+                        NpgsqlDatabaseInfo.Cache[key] = database = await NpgsqlDatabaseInfo.Load(Connection,
+                            timeout, async);
+                    }
+                }
+                finally
+                {
+                    DatabaseInfoSemaphore.Release();
+                }
+            }
+
+            DatabaseInfo = database!;
             TypeMapper.Bind(DatabaseInfo);
         }
 
@@ -442,13 +569,11 @@ namespace Npgsql
             var startupParams = new Dictionary<string, string>
             {
                 ["user"] = username,
-                ["client_encoding"] =
-                    Settings.ClientEncoding ??
-                    Environment.GetEnvironmentVariable("PGCLIENTENCODING") ??
-                    "UTF8"
+                ["client_encoding"] = Settings.ClientEncoding ??
+                                      PostgresEnvironment.ClientEncoding ??
+                                      "UTF8",
+                ["database"] = Settings.Database!
             };
-
-            startupParams["database"] = Settings.Database!;
 
             if (Settings.ApplicationName?.Length > 0)
                 startupParams["application_name"] = Settings.ApplicationName;
@@ -456,17 +581,23 @@ namespace Npgsql
             if (Settings.SearchPath?.Length > 0)
                 startupParams["search_path"] = Settings.SearchPath;
 
-            // SSL renegotiation support has been dropped in recent versions of PostgreSQL
-            // (OpenSSL implementations were buggy etc.), but disable them for older un-patched
-            // versions which turns it on by default.
-            // Amazon Redshift doesn't recognize the ssl_renegotiation_limit parameter and bombs
-            // (https://forums.aws.amazon.com/thread.jspa?messageID=721898&#721898)
-            if (IsSecure && !IsRedshift)
-                startupParams["ssl_renegotiation_limit"] = "0";
-
-            var timezone = Settings.Timezone ?? Environment.GetEnvironmentVariable("PGTZ");
+            var timezone = Settings.Timezone ?? PostgresEnvironment.TimeZone;
             if (timezone != null)
                 startupParams["TimeZone"] = timezone;
+
+            var options = Settings.Options ?? PostgresEnvironment.Options;
+            if (options?.Length > 0)
+                startupParams["options"] = options;
+
+            switch (Settings.ReplicationMode)
+            {
+            case ReplicationMode.Logical:
+                startupParams["replication"] = "database";
+                break;
+            case ReplicationMode.Physical:
+                startupParams["replication"] = "true";
+                break;
+            }
 
             WriteStartup(startupParams);
         }
@@ -477,14 +608,9 @@ namespace Npgsql
             if (username?.Length > 0)
                 return username;
 
-#if NET461
-            if (PGUtil.IsWindows && Type.GetType("Mono.Runtime") == null)
-            {
-                username = WindowsUsernameProvider.GetUsername(Settings.IncludeRealm);
-                if (username?.Length > 0)
-                    return username;
-            }
-#endif
+            username = PostgresEnvironment.User;
+            if (username?.Length > 0)
+                return username;
 
             if (!PGUtil.IsWindows)
             {
@@ -497,18 +623,12 @@ namespace Npgsql
             if (username?.Length > 0)
                 return username;
 
-            username = Environment.GetEnvironmentVariable("USERNAME") ?? Environment.GetEnvironmentVariable("USER");
-            if (username?.Length > 0)
-                return username;
-
-            if (username is null)
-                throw new NpgsqlException("No username could be found, please specify one explicitly");
-
-            return username;
+            throw new NpgsqlException("No username could be found, please specify one explicitly");
         }
 
         async Task RawOpen(NpgsqlTimeout timeout, bool async, CancellationToken cancellationToken)
         {
+            var cert = default(X509Certificate2?);
             try
             {
                 if (async)
@@ -530,17 +650,19 @@ namespace Npgsql
                     RelaxedTextEncoding = Encoding.GetEncoding(Settings.Encoding, EncoderFallback.ReplacementFallback, DecoderFallback.ReplacementFallback);
                 }
 
-                ReadBuffer = new NpgsqlReadBuffer(this, _stream, Settings.ReadBufferSize, TextEncoding, RelaxedTextEncoding);
-                WriteBuffer = new NpgsqlWriteBuffer(this, _stream, Settings.WriteBufferSize, TextEncoding);
+                ReadBuffer = new NpgsqlReadBuffer(this, _stream, _socket, Settings.ReadBufferSize, TextEncoding, RelaxedTextEncoding);
+                WriteBuffer = new NpgsqlWriteBuffer(this, _stream, _socket, Settings.WriteBufferSize, TextEncoding);
+
+                timeout.CheckAndApply(this);
 
                 if (SslMode == SslMode.Require || SslMode == SslMode.Prefer)
                 {
                     WriteSslRequest();
-                    await Flush(async);
+                    await Flush(async, cancellationToken);
 
                     await ReadBuffer.Ensure(1, async);
                     var response = (char)ReadBuffer.ReadByte();
-                    timeout.Check();
+                    timeout.CheckAndApply(this);
 
                     switch (response)
                     {
@@ -551,34 +673,48 @@ namespace Npgsql
                             throw new NpgsqlException("SSL connection requested. No SSL enabled connection from this host is configured.");
                         break;
                     case 'S':
-                        var clientCertificates = new X509CertificateCollection();
-                        if (Settings.ClientCertificate != null)
-                            clientCertificates.Add(new X509Certificate(Settings.ClientCertificate));
-                        else if (Environment.GetEnvironmentVariable("PGSSLCERT") is string envCertPath)
-                            clientCertificates.Add(new X509Certificate(envCertPath));
-                        else if (Environment.GetEnvironmentVariable(PGUtil.IsWindows ? "APPDATA" : "HOME") is string homeDir)
+                        var clientCertificates = new X509Certificate2Collection();
+                        var certPath = Settings.ClientCertificate ?? PostgresEnvironment.SslCert;
+
+                        if (certPath is null && PostgresEnvironment.SslCertDefault is string certPathDefault)
+                            certPath = certPathDefault;
+
+                        if (certPath != null)
                         {
-                            var certPath = Path.Combine(homeDir, "postgresql", "postgresql.crt");
-                            if (File.Exists(certPath))
-                                clientCertificates.Add(new X509Certificate(certPath));
+                            cert = new X509Certificate2(certPath, Settings.ClientCertificateKey ?? PostgresEnvironment.SslKey);
+                            clientCertificates.Add(cert);
                         }
+
                         ProvideClientCertificatesCallback?.Invoke(clientCertificates);
 
-                        RemoteCertificateValidationCallback certificateValidationCallback;
-                        if (Settings.TrustServerCertificate)
-                            certificateValidationCallback = (sender, certificate, chain, errors) => true;
-                        else if (UserCertificateValidationCallback != null)
-                            certificateValidationCallback = UserCertificateValidationCallback;
-                        else
-                            certificateValidationCallback = DefaultUserCertificateValidationCallback;
+                        var certificateValidationCallback = Settings.TrustServerCertificate
+                            ? SslTrustServerValidation
+                            : (Settings.RootCertificate ?? PostgresEnvironment.SslCertRoot ?? PostgresEnvironment.SslCertRootDefault) is { } certRootPath
+                                ? SslRootValidation(certRootPath)
+                                : UserCertificateValidationCallback is { } userValidation
+                                    ? userValidation
+                                    : SslDefaultValidation;
 
-                        var sslStream = new SslStream(_stream, leaveInnerStreamOpen: false, certificateValidationCallback);
-                        if (async)
-                            await sslStream.AuthenticateAsClientAsync(Host, clientCertificates, SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12, Settings.CheckCertificateRevocation);
-                        else
-                            sslStream.AuthenticateAsClient(Host, clientCertificates, SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12, Settings.CheckCertificateRevocation);
-                        _stream = sslStream;
-                        timeout.Check();
+                        timeout.CheckAndApply(this);
+
+                        try
+                        {
+                            var sslStream = new SslStream(_stream, leaveInnerStreamOpen: false, certificateValidationCallback);
+
+                            if (async)
+                                await sslStream.AuthenticateAsClientAsync(Host, clientCertificates,
+                                    SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12, Settings.CheckCertificateRevocation);
+                            else
+                                sslStream.AuthenticateAsClient(Host, clientCertificates,
+                                    SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12, Settings.CheckCertificateRevocation);
+
+                            _stream = sslStream;
+                        }
+                        catch (Exception e)
+                        {
+                            throw new NpgsqlException("Exception while performing SSL handshake", e);
+                        }
+
                         ReadBuffer.Clear();  // Reset to empty after reading single SSL char
                         ReadBuffer.Underlying = _stream;
                         WriteBuffer.Underlying = _stream;
@@ -588,52 +724,32 @@ namespace Npgsql
                     }
                 }
 
-                if (!IsSecure)
-                {
-                    WriteBuffer.AwaitableSocket = new AwaitableSocket(new SocketAsyncEventArgs(), _socket);
-                    ReadBuffer.AwaitableSocket = new AwaitableSocket(new SocketAsyncEventArgs(), _socket);
-                }
-
                 Log.Trace($"Socket connected to {Host}:{Port}");
             }
             catch
             {
-#pragma warning disable CS8625
-                try { _stream?.Dispose(); } catch {
-                    // ignored
-                }
-                _stream = null;
-                try { _baseStream?.Dispose(); }
-                catch
-                {
-                    // ignored
-                }
-                _baseStream = null;
-                try { _socket?.Dispose(); }
-                catch
-                {
-                    // ignored
-                }
-                _socket = null;
+                cert?.Dispose();
+
+                _stream?.Dispose();
+                _stream = null!;
+
+                _baseStream?.Dispose();
+                _baseStream = null!;
+
+                _socket?.Dispose();
+                _socket = null!;
+
                 throw;
-#pragma warning restore CS8625
             }
         }
 
         void Connect(NpgsqlTimeout timeout)
         {
-            EndPoint[] endpoints;
-            if (!string.IsNullOrEmpty(Host) && Host[0] == '/')
-            {
-                endpoints = new EndPoint[] { new UnixEndPoint(Path.Combine(Host, $".s.PGSQL.{Port}")) };
-            }
-            else
-            {
-                // Note that there aren't any timeout-able DNS methods, and we want to use sync-only
-                // methods (not to rely on any TP threads etc.)
-                endpoints = Dns.GetHostAddresses(Host).Select(a => new IPEndPoint(a, Port)).ToArray();
-                timeout.Check();
-            }
+            // Note that there aren't any timeout-able or cancellable DNS methods
+            var endpoints = Path.IsPathRooted(Host)
+                ? new EndPoint[] { new UnixDomainSocketEndPoint(Path.Combine(Host, $".s.PGSQL.{Port}")) }
+                : Dns.GetHostAddresses(Host).Select(a => new IPEndPoint(a, Port)).ToArray();
+            timeout.Check();
 
             // Give each endpoint an equal share of the remaining time
             var perEndpointTimeout = -1;  // Default to infinity
@@ -649,7 +765,11 @@ namespace Npgsql
             {
                 var endpoint = endpoints[i];
                 Log.Trace($"Attempting to connect to {endpoint}");
-                var protocolType = endpoint.AddressFamily == AddressFamily.InterNetwork ? ProtocolType.Tcp : ProtocolType.IP;
+                var protocolType =
+                    endpoint.AddressFamily == AddressFamily.InterNetwork ||
+                    endpoint.AddressFamily == AddressFamily.InterNetworkV6
+                    ? ProtocolType.Tcp
+                    : ProtocolType.IP;
                 var socket = new Socket(endpoint.AddressFamily, SocketType.Stream, protocolType)
                 {
                     Blocking = false
@@ -669,7 +789,7 @@ namespace Npgsql
                     var write = new List<Socket> { socket };
                     var error = new List<Socket> { socket };
                     Socket.Select(null, write, error, perEndpointTimeout);
-                    var errorCode = (int) socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
+                    var errorCode = (int) socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error)!;
                     if (errorCode != 0)
                         throw new SocketException(errorCode);
                     if (!write.Any())
@@ -697,17 +817,11 @@ namespace Npgsql
 
         async Task ConnectAsync(NpgsqlTimeout timeout, CancellationToken cancellationToken)
         {
-            EndPoint[] endpoints;
-            if (!string.IsNullOrEmpty(Host) && Host[0] == '/')
-            {
-                endpoints = new EndPoint[] { new UnixEndPoint(Path.Combine(Host, $".s.PGSQL.{Port}")) };
-            }
-            else
-            {
-                // Note that there aren't any timeoutable or cancellable DNS methods
-                endpoints = (await Dns.GetHostAddressesAsync(Host).WithCancellation(cancellationToken))
-                    .Select(a => new IPEndPoint(a, Port)).ToArray();
-            }
+            // Note that there aren't any timeout-able or cancellable DNS methods
+            var endpoints = Path.IsPathRooted(Host)
+                ? new EndPoint[] { new UnixDomainSocketEndPoint(Path.Combine(Host, $".s.PGSQL.{Port}")) }
+                : (await Dns.GetHostAddressesAsync(Host).WithCancellationAndTimeout(timeout, cancellationToken))
+                .Select(a => new IPEndPoint(a, Port)).ToArray();
 
             // Give each IP an equal share of the remaining time
             var perIpTimespan = default(TimeSpan);
@@ -725,12 +839,34 @@ namespace Npgsql
             {
                 var endpoint = endpoints[i];
                 Log.Trace($"Attempting to connect to {endpoint}");
-                var protocolType = endpoint.AddressFamily == AddressFamily.InterNetwork ? ProtocolType.Tcp : ProtocolType.IP;
+                var protocolType =
+                    endpoint.AddressFamily == AddressFamily.InterNetwork ||
+                    endpoint.AddressFamily == AddressFamily.InterNetworkV6
+                    ? ProtocolType.Tcp
+                    : ProtocolType.IP;
                 var socket = new Socket(endpoint.AddressFamily, SocketType.Stream, protocolType);
+                CancellationTokenSource? combinedCts = null;
                 try
                 {
+                    // .NET 5.0 added cancellation support to ConnectAsync, which allows us to implement real
+                    // cancellation and timeout. On older TFMs, we fake-cancel the operation, i.e. stop waiting
+                    // and raise the exception, but the actual connection task is left running.
+
+#if NETSTANDARD2_0 || NETSTANDARD2_1 || NETCOREAPP3_1
                     await socket.ConnectAsync(endpoint)
                         .WithCancellationAndTimeout(perIpTimeout, cancellationToken);
+#else
+                    var finalCt = cancellationToken;
+
+                    if (perIpTimeout.IsSet)
+                    {
+                        combinedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        combinedCts.CancelAfter((int)perIpTimeout.TimeLeft.TotalMilliseconds);
+                        finalCt = combinedCts.Token;
+                    }
+
+                    await socket.ConnectAsync(endpoint, finalCt);
+#endif
 
                     SetSocketOptions(socket);
                     _socket = socket;
@@ -738,7 +874,10 @@ namespace Npgsql
                 }
                 catch (Exception e)
                 {
-                    try { socket.Dispose(); }
+                    try
+                    {
+                        socket.Dispose();
+                    }
                     catch
                     {
                         // ignored
@@ -755,6 +894,10 @@ namespace Npgsql
                     {
                         throw new NpgsqlException("Exception while connecting", e);
                     }
+                }
+                finally
+                {
+                    combinedCts?.Dispose();
                 }
             }
         }
@@ -774,26 +917,144 @@ namespace Npgsql
                 throw new ArgumentException("If TcpKeepAliveInterval is defined, TcpKeepAliveTime must be defined as well");
             if (Settings.TcpKeepAliveTime > 0)
             {
-                if (!PGUtil.IsWindows)
-                    throw new PlatformNotSupportedException(
-                        "Npgsql management of TCP keepalive is supported only on Windows. " +
-                        "TCP keepalives can still be used on other systems but are enabled via the TcpKeepAlive option or configured globally for the machine, see the relevant docs.");
-
-                var time = Settings.TcpKeepAliveTime;
-                var interval = Settings.TcpKeepAliveInterval > 0
+                var timeSeconds = Settings.TcpKeepAliveTime;
+                var intervalSeconds = Settings.TcpKeepAliveInterval > 0
                     ? Settings.TcpKeepAliveInterval
                     : Settings.TcpKeepAliveTime;
+
+#if NETSTANDARD2_0 || NETSTANDARD2_1
+                var timeMilliseconds = timeSeconds * 1000;
+                var intervalMilliseconds = intervalSeconds * 1000;
 
                 // For the following see https://msdn.microsoft.com/en-us/library/dd877220.aspx
                 var uintSize = Marshal.SizeOf(typeof(uint));
                 var inOptionValues = new byte[uintSize * 3];
                 BitConverter.GetBytes((uint)1).CopyTo(inOptionValues, 0);
-                BitConverter.GetBytes((uint)time).CopyTo(inOptionValues, uintSize);
-                BitConverter.GetBytes((uint)interval).CopyTo(inOptionValues, uintSize * 2);
-                var result = socket.IOControl(IOControlCode.KeepAliveValues, inOptionValues, null);
+                BitConverter.GetBytes((uint)timeMilliseconds).CopyTo(inOptionValues, uintSize);
+                BitConverter.GetBytes((uint)intervalMilliseconds).CopyTo(inOptionValues, uintSize * 2);
+                var result = 0;
+                try
+                {
+                    result = socket.IOControl(IOControlCode.KeepAliveValues, inOptionValues, null);
+                }
+                catch (PlatformNotSupportedException)
+                {
+                    throw new PlatformNotSupportedException("Setting TCP Keepalive Time and TCP Keepalive Interval is supported only on Windows, Mono and .NET Core 3.1+. " +
+                        "TCP keepalives can still be used on other systems but are enabled via the TcpKeepAlive option or configured globally for the machine, see the relevant docs.");
+                }
+
                 if (result != 0)
                     throw new NpgsqlException($"Got non-zero value when trying to set TCP keepalive: {result}");
+#else
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, timeSeconds);
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, intervalSeconds);
+#endif
             }
+        }
+
+        #endregion
+
+        #region I/O
+
+        internal readonly ChannelReader<NpgsqlCommand>? CommandsInFlightReader;
+        internal readonly ChannelWriter<NpgsqlCommand>? CommandsInFlightWriter;
+
+        internal volatile int CommandsInFlightCount;
+
+        internal ManualResetValueTaskSource<object?> ReaderCompleted { get; } =
+            new() { RunContinuationsAsynchronously = true };
+
+        async Task MultiplexingReadLoop()
+        {
+            Debug.Assert(Settings.Multiplexing);
+            Debug.Assert(CommandsInFlightReader != null);
+
+            NpgsqlCommand? command = null;
+            var commandsRead = 0;
+
+            try
+            {
+                while (await CommandsInFlightReader.WaitToReadAsync())
+                {
+                    commandsRead = 0;
+                    Debug.Assert(!InTransaction);
+
+                    while (CommandsInFlightReader.TryRead(out command))
+                    {
+                        commandsRead++;
+
+                        await ReadBuffer.Ensure(5, true);
+
+                        // We have a resultset for the command - hand back control to the command (which will
+                        // return it to the user)
+                        ReaderCompleted.Reset();
+                        command.ExecutionCompletion.SetResult(this);
+
+                        // Now wait until that command's reader is disposed. Note that RunContinuationsAsynchronously is
+                        // true, so that the user code calling NpgsqlDataReader.Dispose will not continue executing
+                        // synchronously here. The prevents issues if the code after the next command's execution
+                        // completion blocks.
+                        await new ValueTask(ReaderCompleted, ReaderCompleted.Version);
+                        Debug.Assert(!InTransaction);
+                    }
+
+                    // Atomically update the commands in-flight counter, and check if it reached 0. If so, the
+                    // connector is idle and can be returned.
+                    // Note that this is racing with over-capacity writing, which can select any connector at any
+                    // time (see MultiplexingWriteLoop), and we must make absolutely sure that if a connector is
+                    // returned to the pool, it is *never* written to unless properly dequeued from the Idle channel.
+                    if (Interlocked.Add(ref CommandsInFlightCount, -commandsRead) == 0)
+                    {
+                        // There's a race condition where the continuation of an asynchronous multiplexing write may not
+                        // have executed yet, and the flush may still be in progress. We know all I/O has already
+                        // been sent - because the reader has already consumed the entire resultset. So we wait until
+                        // the connector's write lock has been released (long waiting will never occur here).
+                        SpinWait.SpinUntil(() => MultiplexAsyncWritingLock == 0);
+
+                        _pool!.Return(this);
+                    }
+                }
+
+                Log.Trace("Exiting multiplexing read loop", Id);
+            }
+            catch (Exception e)
+            {
+                Debug.Assert(IsBroken);
+
+                // Decrement the commands already dequeued from the in-flight counter
+                Interlocked.Add(ref CommandsInFlightCount, -commandsRead);
+
+                // When a connector is broken, the causing exception is stored on it. We fail commands with
+                // that exception - rather than the one thrown here - since the break may have happened during
+                // writing, and we want to bubble that one up.
+
+                // Drain any pending in-flight commands and fail them. Note that some have only been written
+                // to the buffer, and not sent to the server.
+                command?.ExecutionCompletion.SetException(_breakReason!);
+                try
+                {
+                    while (true)
+                    {
+                        var pendingCommand = await CommandsInFlightReader.ReadAsync();
+
+                        // TODO: the exception we have here is sometimes just the result of the write loop breaking
+                        // the connector, so it doesn't represent the actual root cause.
+                        pendingCommand.ExecutionCompletion.SetException(_breakReason!);
+                    }
+                }
+                catch (ChannelClosedException)
+                {
+                    // All good, drained to the channel and failed all commands
+                }
+
+                // "Return" the connector to the pool to for cleanup (e.g. update total connector count)
+                _pool!.Return(this);
+
+                Log.Error("Exception in multiplexing read loop", e, Id);
+            }
+
+            Debug.Assert(CommandsInFlightCount == 0);
         }
 
         #endregion
@@ -805,7 +1066,7 @@ namespace Npgsql
         /// </summary>
         internal void PrependInternalMessage(byte[] rawMessage, int responseMessageCount)
         {
-            _pendingPrependedResponses += responseMessageCount;
+            PendingPrependedResponses += responseMessageCount;
 
             var t = WritePregenerated(rawMessage);
             Debug.Assert(t.IsCompleted, "Could not fully write pregenerated message into the buffer");
@@ -815,26 +1076,26 @@ namespace Npgsql
 
         #region Backend message processing
 
-        internal IBackendMessage ReadMessage(DataRowLoadingMode dataRowLoadingMode=DataRowLoadingMode.NonSequential)
-            => ReadMessage(false, dataRowLoadingMode).GetAwaiter().GetResult()!;
+        internal IBackendMessage ReadMessage(DataRowLoadingMode dataRowLoadingMode = DataRowLoadingMode.NonSequential)
+            => ReadMessage(async: false, dataRowLoadingMode).GetAwaiter().GetResult();
 
         internal ValueTask<IBackendMessage> ReadMessage(bool async, DataRowLoadingMode dataRowLoadingMode = DataRowLoadingMode.NonSequential)
-            => DoReadMessage(async, dataRowLoadingMode)!;
+            => ReadMessage(async, dataRowLoadingMode, readingNotifications: false)!;
 
         internal ValueTask<IBackendMessage?> ReadMessageWithNotifications(bool async)
-            => DoReadMessage(async, DataRowLoadingMode.NonSequential, true);
+            => ReadMessage(async, DataRowLoadingMode.NonSequential, readingNotifications: true);
 
-        ValueTask<IBackendMessage?> DoReadMessage(
+        internal ValueTask<IBackendMessage?> ReadMessage(
             bool async,
-            DataRowLoadingMode dataRowLoadingMode = DataRowLoadingMode.NonSequential,
-            bool readingNotifications = false)
+            DataRowLoadingMode dataRowLoadingMode,
+            bool readingNotifications)
         {
-            if (_pendingPrependedResponses > 0 ||
+            if (PendingPrependedResponses > 0 ||
                 dataRowLoadingMode != DataRowLoadingMode.NonSequential ||
                 readingNotifications ||
                 ReadBuffer.ReadBytesLeft < 5)
             {
-                return ReadMessageLong(dataRowLoadingMode, readingNotifications);
+                return ReadMessageLong(this, async, dataRowLoadingMode, readingNotifications: readingNotifications);
             }
 
             var messageCode = (BackendMessageCode)ReadBuffer.ReadByte();
@@ -845,7 +1106,9 @@ namespace Npgsql
             case BackendMessageCode.ParameterStatus:
             case BackendMessageCode.ErrorResponse:
                 ReadBuffer.ReadPosition--;
-                return ReadMessageLong(dataRowLoadingMode, readingNotifications2: false);
+                return ReadMessageLong(this, async, dataRowLoadingMode, readingNotifications: false);
+            case BackendMessageCode.ReadyForQuery:
+                break;
             }
 
             PGUtil.ValidateBackendMessageCode(messageCode);
@@ -853,30 +1116,31 @@ namespace Npgsql
             if (len > ReadBuffer.ReadBytesLeft)
             {
                 ReadBuffer.ReadPosition -= 5;
-                return ReadMessageLong(dataRowLoadingMode, readingNotifications2: false);
+                return ReadMessageLong(this, async, dataRowLoadingMode, readingNotifications: false);
             }
 
             return new ValueTask<IBackendMessage?>(ParseServerMessage(ReadBuffer, messageCode, len, false));
 
-            async ValueTask<IBackendMessage?> ReadMessageLong(
-                DataRowLoadingMode dataRowLoadingMode2,
-                bool readingNotifications2,
+            static async ValueTask<IBackendMessage?> ReadMessageLong(
+                NpgsqlConnector connector,
+                bool async,
+                DataRowLoadingMode dataRowLoadingMode,
+                bool readingNotifications,
                 bool isReadingPrependedMessage = false)
             {
                 // First read the responses of any prepended messages.
-                if (_pendingPrependedResponses > 0 && !isReadingPrependedMessage)
+                if (connector.PendingPrependedResponses > 0 && !isReadingPrependedMessage)
                 {
                     try
                     {
                         // TODO: There could be room for optimization here, rather than the async call(s)
-                        ReceiveTimeout = InternalCommandTimeout;
-                        for (; _pendingPrependedResponses > 0; _pendingPrependedResponses--)
-                            await ReadMessageLong(DataRowLoadingMode.Skip, false, true);
+                        connector.ReadBuffer.Timeout = TimeSpan.FromMilliseconds(connector.InternalCommandTimeout);
+                        for (; connector.PendingPrependedResponses > 0; connector.PendingPrependedResponses--)
+                            await ReadMessageLong(connector, async, DataRowLoadingMode.Skip, readingNotifications: false, isReadingPrependedMessage: true);
                     }
-                    catch (PostgresException)
+                    catch (PostgresException e)
                     {
-                        Break();
-                        throw;
+                        throw connector.Break(e);
                     }
                 }
 
@@ -884,38 +1148,43 @@ namespace Npgsql
 
                 try
                 {
-                    ReceiveTimeout = UserTimeout;
+                    connector.ReadBuffer.Timeout = TimeSpan.FromMilliseconds(connector.UserTimeout);
 
                     while (true)
                     {
-                        await ReadBuffer.Ensure(5, async, readingNotifications2);
-                        messageCode = (BackendMessageCode)ReadBuffer.ReadByte();
+                        await connector.ReadBuffer.Ensure(5, async, readingNotifications);
+                        var messageCode = (BackendMessageCode)connector.ReadBuffer.ReadByte();
                         PGUtil.ValidateBackendMessageCode(messageCode);
-                        len = ReadBuffer.ReadInt32() - 4; // Transmitted length includes itself
+                        var len = connector.ReadBuffer.ReadInt32() - 4; // Transmitted length includes itself
 
                         if ((messageCode == BackendMessageCode.DataRow &&
-                             dataRowLoadingMode2 != DataRowLoadingMode.NonSequential) ||
+                             dataRowLoadingMode != DataRowLoadingMode.NonSequential) ||
                             messageCode == BackendMessageCode.CopyData)
                         {
-                            if (dataRowLoadingMode2 == DataRowLoadingMode.Skip)
+                            if (dataRowLoadingMode == DataRowLoadingMode.Skip)
                             {
-                                await ReadBuffer.Skip(len, async);
+                                await connector.ReadBuffer.Skip(len, async);
                                 continue;
                             }
                         }
-                        else if (len > ReadBuffer.ReadBytesLeft)
+                        else if (len > connector.ReadBuffer.ReadBytesLeft)
                         {
-                            if (len > ReadBuffer.Size)
+                            if (len > connector.ReadBuffer.Size)
                             {
-                                if (_origReadBuffer == null)
-                                    _origReadBuffer = ReadBuffer;
-                                ReadBuffer = ReadBuffer.AllocateOversize(len);
+                                var oversizeBuffer = connector.ReadBuffer.AllocateOversize(len);
+
+                                if (connector._origReadBuffer == null)
+                                    connector._origReadBuffer = connector.ReadBuffer;
+                                else
+                                    connector.ReadBuffer.Dispose();
+
+                                connector.ReadBuffer = oversizeBuffer;
                             }
 
-                            await ReadBuffer.Ensure(len, async);
+                            await connector.ReadBuffer.Ensure(len, async);
                         }
 
-                        var msg = ParseServerMessage(ReadBuffer, messageCode, len, isReadingPrependedMessage);
+                        var msg = connector.ParseServerMessage(connector.ReadBuffer, messageCode, len, isReadingPrependedMessage);
 
                         switch (messageCode)
                         {
@@ -924,9 +1193,9 @@ namespace Npgsql
 
                             // An ErrorResponse is (almost) always followed by a ReadyForQuery. Save the error
                             // and throw it as an exception when the ReadyForQuery is received (next).
-                            error = PostgresException.Load(ReadBuffer);
+                            error = PostgresException.Load(connector.ReadBuffer, connector.Settings.IncludeErrorDetails);
 
-                            if (State == ConnectorState.Connecting)
+                            if (connector.State == ConnectorState.Connecting)
                             {
                                 // During the startup/authentication phase, an ErrorResponse isn't followed by
                                 // an RFQ. Instead, the server closes the connection immediately
@@ -950,7 +1219,7 @@ namespace Npgsql
                         case BackendMessageCode.NotificationResponse:
                         case BackendMessageCode.ParameterStatus:
                             Debug.Assert(msg == null);
-                            if (!readingNotifications2)
+                            if (!readingNotifications)
                                 continue;
                             return null;
                         }
@@ -959,17 +1228,23 @@ namespace Npgsql
                         return msg;
                     }
                 }
-                catch (PostgresException)
+                catch (PostgresException e)
                 {
-                    if (CurrentReader != null)
+                    // TODO: move it up the stack, like #3126 did (relevant for non-command-execution scenarios, like COPY)
+                    if (connector.CurrentReader is null)
+                        connector.EndUserAction();
+
+                    if (e.SqlState == PostgresErrorCodes.QueryCanceled && connector.PostgresCancellationPerformed)
                     {
-                        // The reader cleanup will call EndUserAction
-                        await CurrentReader.Cleanup(async);
+                        // The query could be canceled because of a user cancellation or a timeout - raise the proper exception.
+                        // If _postgresCancellationPerformed is false, this is an unsolicited cancellation -
+                        // just bubble up thePostgresException.
+                        throw connector.UserCancellationRequested
+                            ? new OperationCanceledException("Query was cancelled", e, connector.UserCancellationToken)
+                            : new NpgsqlException("Exception while reading from stream",
+                                new TimeoutException("Timeout during reading attempt"));
                     }
-                    else
-                    {
-                        EndUserAction();
-                    }
+
                     throw;
                 }
                 catch (NpgsqlException)
@@ -990,7 +1265,7 @@ namespace Npgsql
                     return _rowDescriptionMessage.Load(buf, TypeMapper);
                 case BackendMessageCode.DataRow:
                     return _dataRowMessage.Load(len);
-                case BackendMessageCode.CompletedResponse:
+                case BackendMessageCode.CommandComplete:
                     return _commandCompleteMessage.Load(buf, len);
                 case BackendMessageCode.ReadyForQuery:
                     var rfq = _readyForQueryMessage.Load(buf);
@@ -1018,7 +1293,7 @@ namespace Npgsql
                     ReadParameterStatus(buf.GetNullTerminatedBytes(), buf.GetNullTerminatedBytes());
                     return null;
                 case BackendMessageCode.NoticeResponse:
-                    var notice = PostgresNotice.Load(buf);
+                    var notice = PostgresNotice.Load(buf, Settings.IncludeErrorDetails);
                     Log.Debug($"Received notice: {notice.MessageText}", Id);
                     Connection?.OnNotice(notice);
                     return null;
@@ -1051,6 +1326,9 @@ namespace Npgsql
                     return (_copyOutResponseMessage ??= new CopyOutResponseMessage()).Load(ReadBuffer);
                 case BackendMessageCode.CopyData:
                     return (_copyDataMessage ??= new CopyDataMessage()).Load(len);
+                case BackendMessageCode.CopyBothResponse:
+                    return (_copyBothResponseMessage ??= new CopyBothResponseMessage()).Load(ReadBuffer);
+
                 case BackendMessageCode.CopyDone:
                     return CopyDoneMessage.Instance;
 
@@ -1080,7 +1358,7 @@ namespace Npgsql
 
             while (true)
             {
-                var msg = ReadMessage(false, DataRowLoadingMode.Skip).GetAwaiter().GetResult()!;
+                var msg = ReadMessage(async: false, DataRowLoadingMode.Skip).GetAwaiter().GetResult()!;
                 Debug.Assert(!(msg is DataRowMessage));
                 if (msg.Code == stopAt)
                     return msg;
@@ -1091,11 +1369,11 @@ namespace Npgsql
 
         #region Transactions
 
-        internal Task Rollback(bool async)
+        internal async Task Rollback(bool async, CancellationToken cancellationToken = default)
         {
             Log.Debug("Rolling back transaction", Id);
-            using (StartUserAction())
-                return ExecuteInternalCommand(PregeneratedMessages.RollbackTransaction, async);
+            using (StartUserAction(cancellationToken))
+                await ExecuteInternalCommand(PregeneratedMessages.RollbackTransaction, async, cancellationToken);
         }
 
         internal bool InTransaction
@@ -1113,32 +1391,37 @@ namespace Npgsql
         /// </summary>
         void ProcessNewTransactionStatus(TransactionStatus newStatus)
         {
-            if (newStatus == TransactionStatus) { return; }
+            if (newStatus == TransactionStatus)
+                return;
 
-            switch (newStatus) {
+            TransactionStatus = newStatus;
+
+            switch (newStatus)
+            {
             case TransactionStatus.Idle:
-                ClearTransaction();
                 break;
             case TransactionStatus.InTransactionBlock:
             case TransactionStatus.InFailedTransactionBlock:
+                // In multiplexing mode, we can't support transaction in SQL: the connector must be removed from the
+                // writable connectors list, otherwise other commands may get written to it. So the user must tell us
+                // about the transaction via BeginTransaction.
+                if (Connection is null)
+                {
+                    Debug.Assert(Settings.Multiplexing);
+                    throw new NotSupportedException("In multiplexing mode, transactions must be started with BeginTransaction");
+                }
                 break;
             case TransactionStatus.Pending:
-                throw new Exception("Invalid TransactionStatus (should be frontend-only)");
+                throw new Exception($"Internal Npgsql bug: invalid TransactionStatus {nameof(TransactionStatus.Pending)} received, should be frontend-only");
             default:
-                throw new InvalidOperationException($"Internal Npgsql bug: unexpected value {newStatus} of enum {nameof(TransactionStatus)}. Please file a bug.");
+                throw new InvalidOperationException(
+                    $"Internal Npgsql bug: unexpected value {newStatus} of enum {nameof(TransactionStatus)}. Please file a bug.");
             }
-            TransactionStatus = newStatus;
         }
 
-        void ClearTransaction()
+        internal void ClearTransaction()
         {
-            if (TransactionStatus == TransactionStatus.Idle) { return; }
-            // We may not have an NpgsqlTransaction for the transaction (i.e. user executed BEGIN)
-            if (Transaction != null)
-            {
-                Transaction.Clear();
-                Transaction = null;
-            }
+            Transaction?.DisposeImmediately();
             TransactionStatus = TransactionStatus.Idle;
         }
 
@@ -1151,25 +1434,103 @@ namespace Npgsql
         /// </summary>
         internal bool IsSecure { get; private set; }
 
-#pragma warning disable CA1801 // Review unused parameters
-        static bool DefaultUserCertificateValidationCallback(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors)
+        /// <summary>
+        /// Returns whether SCRAM-SHA256 is being user for the connection
+        /// </summary>
+        internal bool IsScram { get; private set; }
+
+        /// <summary>
+        /// Returns whether SCRAM-SHA256-PLUS is being user for the connection
+        /// </summary>
+        internal bool IsScramPlus { get; private set; }
+
+        static readonly RemoteCertificateValidationCallback SslDefaultValidation =
+            (sender, certificate, chain, sslPolicyErrors)
             => sslPolicyErrors == SslPolicyErrors.None;
-#pragma warning restore CA1801 // Review unused parameters
+
+        static readonly RemoteCertificateValidationCallback SslTrustServerValidation =
+            (sender, certificate, chain, sslPolicyErrors)
+            => true;
+
+        static RemoteCertificateValidationCallback SslRootValidation(string certRootPath) =>
+            (sender, certificate, chain, sslPolicyErrors) =>
+            {
+                if (certificate is null || chain is null)
+                    return false;
+
+                chain.ChainPolicy.ExtraStore.Add(new X509Certificate2(certRootPath));
+                return chain.Build(certificate as X509Certificate2 ?? new X509Certificate2(certificate));
+            };
 
         #endregion SSL
 
         #region Cancel
 
-        /// <summary>
-        /// Creates another connector and sends a cancel request through it for this connector.
-        /// </summary>
-        internal void CancelRequest()
+        internal void PerformUserCancellation()
         {
-            if (BackendProcessId == 0)
-                throw new NpgsqlException("Cancellation not supported on this database (no BackendKeyData was received during connection)");
-            Log.Debug("Sending cancellation...", Id);
             lock (CancelLock)
             {
+                _userCancellationRequested = true;
+
+                if (AttemptPostgresCancellation && SupportsPostgresCancellation)
+                {
+                    var cancellationTimeout = Settings.CancellationTimeout;
+                    if (PerformPostgresCancellation() && cancellationTimeout >= 0)
+                    {
+                        if (cancellationTimeout > 0)
+                        {
+                            lock (this)
+                            {
+                                if (!IsConnected)
+                                    return;
+                                UserTimeout = cancellationTimeout;
+                                ReadBuffer.Timeout = TimeSpan.FromMilliseconds(cancellationTimeout);
+                                ReadBuffer.Cts.CancelAfter(cancellationTimeout);
+                            }
+                        }
+
+                        return;
+                    }
+                }
+
+                lock (this)
+                {
+                    if (!IsConnected)
+                        return;
+                    UserTimeout = -1;
+                    ReadBuffer.Timeout = _cancelImmediatelyTimeout;
+                    ReadBuffer.Cts.Cancel();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Creates another connector and sends a cancel request through it for this connector. This method never throws, but returns
+        /// whether the cancellation attempt failed.
+        /// </summary>
+        /// <returns>
+        /// <para>
+        /// <see langword="true" /> if the cancellation request was successfully delivered, or if it was skipped because a previous
+        /// request was already sent. <see langword="false"/> if the cancellation request could not be delivered because of an exception
+        /// (the method logs internally).
+        /// </para>
+        /// <para>
+        /// This does not indicate whether the cancellation attempt was successful on the PostgreSQL side - only if the request was
+        /// delivered.
+        /// </para>
+        /// </returns>
+        internal bool PerformPostgresCancellation()
+        {
+            Debug.Assert(BackendProcessId != 0, "PostgreSQL cancellation requested by the backend doesn't support it");
+
+            lock (CancelLock)
+            {
+                if (PostgresCancellationPerformed)
+                    return true;
+
+                Log.Debug("Sending cancellation...", Id);
+                PostgresCancellationPerformed = true;
+
                 try
                 {
                     var cancelConnector = new NpgsqlConnector(this);
@@ -1179,8 +1540,13 @@ namespace Npgsql
                 {
                     var socketException = e.InnerException as SocketException;
                     if (socketException == null || socketException.SocketErrorCode != SocketError.ConnectionReset)
+                    {
                         Log.Debug("Exception caught while attempting to cancel command", e, Id);
+                        return false;
+                    }
                 }
+
+                return true;
             }
         }
 
@@ -1210,54 +1576,95 @@ namespace Npgsql
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal CancellationTokenRegistration StartCancellableOperation(
+            CancellationToken cancellationToken = default,
+            bool attemptPgCancellation = true)
+        {
+            _userCancellationRequested = PostgresCancellationPerformed = false;
+            UserCancellationToken = cancellationToken;
+            ReadBuffer.Cts.ResetCts();
+
+            AttemptPostgresCancellation = attemptPgCancellation;
+            return _cancellationTokenRegistration =
+                cancellationToken.Register(static c => ((NpgsqlConnector)c!).PerformUserCancellation(), this);
+        }
+
+        /// <summary>
+        /// Starts a new cancellable operation within an ongoing user action. This should only be used if a single user
+        /// action spans several different actions which each has its own cancellation tokens. For example, a command
+        /// execution is a single user action, but spans ExecuteReaderQuery, NextResult, Read and so forth.
+        /// </summary>
+        /// <remarks>
+        /// Only one level of nested operations is supported. It is an error to call this method if it has previously
+        /// been called, and the returned <see cref="CancellationTokenRegistration"/> was not disposed.
+        /// </remarks>
+        /// <param name="cancellationToken">
+        /// The cancellation token provided by the user. Callbacks will be registered on this token for executing the
+        /// cancellation, and the token will be included in any thrown <see cref="OperationCanceledException"/>.
+        /// </param>
+        /// <param name="attemptPgCancellation">
+        /// If <see langword="true" />, PostgreSQL cancellation will be attempted when the user requests cancellation or
+        /// a timeout occurs, followed by a client-side socket cancellation once
+        /// <see cref="NpgsqlConnectionStringBuilder.CancellationTimeout"/> has elapsed. If <see langword="false" />,
+        /// PostgreSQL cancellation will be skipped and client-socket cancellation will occur immediately.
+        /// </param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal CancellationTokenRegistration StartNestedCancellableOperation(
+            CancellationToken cancellationToken = default,
+            bool attemptPgCancellation = true)
+        {
+            UserCancellationToken = cancellationToken;
+            AttemptPostgresCancellation = attemptPgCancellation;
+
+            return _cancellationTokenRegistration =
+                cancellationToken.Register(static c => ((NpgsqlConnector)c!).PerformUserCancellation(), this);
+        }
+
         #endregion Cancel
 
         #region Close / Reset
 
-        internal bool HasOngoingOperation => CurrentReader != null || CurrentCopyOperation != null;
-
         /// <summary>
         /// Closes ongoing operations, i.e. an open reader exists or a COPY operation still in progress, as
         /// part of a connection close.
-        /// Does nothing if the thread has been aborted - the connector will be closed immediately.
         /// </summary>
-        internal async Task CloseOngoingOperations(bool async)
+        internal async Task CloseOngoingOperations(bool async, CancellationToken cancellationToken = default)
         {
             var reader = CurrentReader;
             var copyOperation = CurrentCopyOperation;
 
             if (reader != null)
-                await reader.Close(connectionClosing: true, async);
-
-            if (copyOperation == null)
-                return;
-
-            // TODO: There's probably a race condition as the COPY operation may finish on its own during the next few lines
-
-            // Note: we only want to cancel import operations, since in these cases cancel is safe.
-            // Export cancellations go through the PostgreSQL "asynchronous" cancel mechanism and are
-            // therefore vulnerable to the race condition in #615.
-            if (copyOperation is NpgsqlBinaryImporter ||
-                copyOperation is NpgsqlCopyTextWriter ||
-                copyOperation is NpgsqlRawCopyStream rawCopyStream && rawCopyStream.CanWrite)
+                await reader.Close(connectionClosing: true, async, isDisposing: false);
+            else if (copyOperation != null)
             {
+                // TODO: There's probably a race condition as the COPY operation may finish on its own during the next few lines
+
+                // Note: we only want to cancel import operations, since in these cases cancel is safe.
+                // Export cancellations go through the PostgreSQL "asynchronous" cancel mechanism and are
+                // therefore vulnerable to the race condition in #615.
+                if (copyOperation is NpgsqlBinaryImporter ||
+                    copyOperation is NpgsqlCopyTextWriter ||
+                    copyOperation is NpgsqlRawCopyStream rawCopyStream && rawCopyStream.CanWrite)
+                {
+                    try
+                    {
+                        copyOperation.Cancel();
+                    }
+                    catch (Exception e)
+                    {
+                        Log.Warn("Error while cancelling COPY on connector close", e, Id);
+                    }
+                }
+
                 try
                 {
-                    copyOperation.Cancel();
+                    copyOperation.Dispose();
                 }
                 catch (Exception e)
                 {
-                    Log.Warn("Error while cancelling COPY on connector close", e, Id);
+                    Log.Warn("Error while disposing cancelled COPY on connector close", e, Id);
                 }
-            }
-
-            try
-            {
-                copyOperation.Dispose();
-            }
-            catch (Exception e)
-            {
-                Log.Warn("Error while disposing cancelled COPY on connector close", e, Id);
             }
         }
 
@@ -1291,8 +1698,6 @@ namespace Npgsql
                 }
 
                 State = ConnectorState.Closed;
-                Counters.NumberOfNonPooledConnections.Decrement();
-                Counters.HardDisconnectsPerSecond.Increment();
                 Cleanup();
             }
         }
@@ -1304,41 +1709,39 @@ namespace Npgsql
         /// connector and returns the appropriate message.
         /// </summary>
         internal Exception UnexpectedMessageReceived(BackendMessageCode received)
-        {
-            Break();
-            return new Exception($"Received unexpected backend message {received}. Please file a bug.");
-        }
+            => throw Break(new Exception($"Received unexpected backend message {received}. Please file a bug."));
 
         /// <summary>
         /// Called when a connector becomes completely unusable, e.g. when an unexpected I/O exception is raised or when
         /// we lose protocol sync.
         /// Note that fatal errors during the Open phase do *not* pass through here.
         /// </summary>
-        internal void Break()
+        /// <param name="reason">The exception that caused the break.</param>
+        /// <returns>The exception given in <paramref name="reason"/> for chaining calls.</returns>
+        internal Exception Break(Exception reason)
         {
             Debug.Assert(!IsClosed);
 
             lock (this)
             {
-                if (State == ConnectorState.Broken)
-                    return;
-
-                Log.Error("Breaking connector", Id);
-                State = ConnectorState.Broken;
-                var conn = Connection;
-                Cleanup();
-
-                // We have no connection if we're broken by a keepalive occuring while the connector is in the pool
-                // When we break, we normally need to call into NpgsqlConnection to reset its state.
-                // The exception to this is when we're connecting, in which case the exception bubbles up and
-                // try/catch above takes care of everything.
-                if (conn != null && !_isConnecting)
+                if (State != ConnectorState.Broken)
                 {
-                    // Note that the connection's full state is usually calculated from the connector's, but in
-                    // states closed/broken the connector is null. We therefore need a way to distinguish between
-                    // Closed and Broken on the connection.
-                     conn.Close(wasBroken: true, async: false);
+                    Log.Error("Breaking connector", reason, Id);
+
+                    // Note that we may be reading and writing from the same connector concurrently, so safely set
+                    // the original reason for the break before actually closing the socket etc.
+                    Interlocked.CompareExchange(ref _breakReason, reason, null);
+                    State = ConnectorState.Broken;
+
+                    var connection = Connection;
+
+                    Cleanup();
+
+                    if (connection is not null)
+                        connection.FullState = ConnectionState.Broken;
                 }
+
+                return reason;
             }
         }
 
@@ -1352,10 +1755,24 @@ namespace Npgsql
         {
             Debug.Assert(Monitor.IsEntered(this));
 
+            if (Settings.Multiplexing)
+            {
+                FlagAsNotWritableForMultiplexing();
+
+                // Note that in multiplexing, this could be called from the read loop, while the write loop is
+                // writing into the channel. To make sure this race condition isn't a problem, the channel currently
+                // isn't set up with SingleWriter (since at this point it doesn't do anything).
+                CommandsInFlightWriter!.Complete();
+
+                // The connector's read loop has a continuation to observe and log any exception coming out
+                // (see Open)
+            }
+
+
             Log.Trace("Cleaning up connector", Id);
             try
             {
-                _stream.Dispose();
+                _stream?.Dispose();
             }
             catch
             {
@@ -1378,13 +1795,16 @@ namespace Npgsql
             }
 
             ClearTransaction();
+
 #pragma warning disable CS8625
 
             _stream = null;
             _baseStream = null;
-            ReadBuffer?.AwaitableSocket?.Dispose();
+            _origReadBuffer?.Dispose();
+            _origReadBuffer = null;
+            ReadBuffer?.Dispose();
             ReadBuffer = null;
-            WriteBuffer?.AwaitableSocket?.Dispose();
+            WriteBuffer?.Dispose();
             WriteBuffer = null;
             Connection = null;
             PostgresParameters.Clear();
@@ -1397,6 +1817,7 @@ namespace Npgsql
                 _keepAliveTimer!.Change(Timeout.Infinite, Timeout.Infinite);
                 _keepAliveTimer.Dispose();
             }
+
 #pragma warning restore CS8625
         }
 
@@ -1441,64 +1862,52 @@ namespace Npgsql
         /// (e.g. prepared statements), resetting parameters to their defaults, and resetting client-side
         /// state
         /// </summary>
-        /// <remarks>
-        /// It's important that this method be idempotent, since some race conditions in the pool
-        /// can cause it to be called twice (and also the user may close the connection right after
-        /// allocating it, without doing anything).
-        /// </remarks>
-        internal void Reset()
+        internal async Task Reset(bool async, CancellationToken cancellationToken = default)
         {
-            Debug.Assert(State == ConnectorState.Ready);
-
-            Connection = null;
-
-            switch (State)
-            {
-            case ConnectorState.Ready:
-                break;
-            case ConnectorState.Closed:
-            case ConnectorState.Broken:
-                return;
-            case ConnectorState.Connecting:
-            case ConnectorState.Executing:
-            case ConnectorState.Fetching:
-            case ConnectorState.Copy:
-            case ConnectorState.Waiting:
-                throw new InvalidOperationException("Reset() called on connector with state " + State);
-            default:
-                throw new InvalidOperationException($"Internal Npgsql bug: unexpected value {State} of enum {nameof(ConnectorState)}. Please file a bug.");
-            }
+            Debug.Assert(IsReady);
 
             // Our buffer may contain unsent prepended messages (such as BeginTransaction), clear it out completely
             WriteBuffer.Clear();
-            _pendingPrependedResponses = 0;
+            PendingPrependedResponses = 0;
 
             // We may have allocated an oversize read buffer, switch back to the original one
+            // TODO: Replace this with array pooling, #2326
             if (_origReadBuffer != null)
             {
+                ReadBuffer.Dispose();
                 ReadBuffer = _origReadBuffer;
                 _origReadBuffer = null;
             }
+
+            Transaction?.UnbindIfNecessary();
+
+            var endBindingScope = false;
 
             // Must rollback transaction before sending DISCARD ALL
             switch (TransactionStatus)
             {
             case TransactionStatus.Idle:
+                // There is an undisposed transaction on multiplexing connection
+                endBindingScope = Connection?.ConnectorBindingScope == ConnectorBindingScope.Transaction;
                 break;
             case TransactionStatus.Pending:
                 // BeginTransaction() was called, but was left in the write buffer and not yet sent to server.
                 // Just clear the transaction state.
+                ProcessNewTransactionStatus(TransactionStatus.Idle);
                 ClearTransaction();
+                endBindingScope = true;
                 break;
             case TransactionStatus.InTransactionBlock:
             case TransactionStatus.InFailedTransactionBlock:
-                Rollback(false);
+                await Rollback(async, cancellationToken);
+                ClearTransaction();
+                endBindingScope = true;
                 break;
             default:
                 throw new InvalidOperationException($"Internal Npgsql bug: unexpected value {TransactionStatus} of enum {nameof(TransactionStatus)}. Please file a bug.");
             }
 
-            if (!Settings.NoResetOnClose && DatabaseInfo.SupportsDiscard)
+            if (_sendResetOnClose)
             {
                 if (PreparedStatementManager.NumPrepared > 0)
                 {
@@ -1513,6 +1922,15 @@ namespace Npgsql
                     PrependInternalMessage(PregeneratedMessages.DiscardAll, 2);
                 }
             }
+
+            DataReader.UnbindIfNecessary();
+            
+            if (endBindingScope)
+            {
+                // Connection is null if a connection enlisted in a TransactionScope was closed before the
+                // TransactionScope completed - the connector is still enlisted, but has no connection.
+                Connection?.EndBindingScope(ConnectorBindingScope.Transaction);
+            }
         }
 
         internal void UnprepareAll()
@@ -1525,10 +1943,39 @@ namespace Npgsql
 
         #region Locking
 
-        internal UserAction StartUserAction(NpgsqlCommand command)
-            => StartUserAction(ConnectorState.Executing, command);
+        internal UserAction StartUserAction(CancellationToken cancellationToken = default, bool attemptPgCancellation = true)
+            => StartUserAction(ConnectorState.Executing, command: null, cancellationToken, attemptPgCancellation);
 
-        internal UserAction StartUserAction(ConnectorState newState=ConnectorState.Executing, NpgsqlCommand? command = null)
+        internal UserAction StartUserAction(
+            ConnectorState newState,
+            CancellationToken cancellationToken = default,
+            bool attemptPgCancellation = true)
+            => StartUserAction(newState, command: null, cancellationToken, attemptPgCancellation);
+
+        /// <summary>
+        /// Starts a user action. This makes sure that another action isn't already in progress, handles synchronization with keepalive,
+        /// and sets up cancellation.
+        /// </summary>
+        /// <param name="newState">The new state to be set when entering this user action.</param>
+        /// <param name="command">
+        /// The <see cref="NpgsqlCommand" /> that is starting execution - if an <see cref="NpgsqlOperationInProgressException" /> is
+        /// thrown, it will reference this.
+        /// </param>
+        /// <param name="cancellationToken">
+        /// The cancellation token provided by the user. Callbacks will be registered on this token for executing the cancellation,
+        /// and the token will be included in any thrown <see cref="OperationCanceledException"/>.
+        /// </param>
+        /// <param name="attemptPgCancellation">
+        /// If <see langword="true" />, PostgreSQL cancellation will be attempted when the user requests cancellation or a timeout
+        /// occurs, followed by a client-side socket cancellation once <see cref="NpgsqlConnectionStringBuilder.CancellationTimeout"/> has
+        /// elapsed. If <see langword="false" />, PostgreSQL cancellation will be skipped and client-socket cancellation will occur
+        /// immediately.
+        /// </param>
+        internal UserAction StartUserAction(
+            ConnectorState newState,
+            NpgsqlCommand? command,
+            CancellationToken cancellationToken = default,
+            bool attemptPgCancellation = true)
         {
             // If keepalive is enabled, we must protect state transitions with a SemaphoreSlim
             // (which itself must be protected by a lock, since its dispose isn't thread-safe).
@@ -1542,6 +1989,13 @@ namespace Npgsql
 
             lock (this)
             {
+                if (!IsConnected)
+                {
+                    throw IsBroken
+                        ? new NpgsqlException("The connection was previously broken because of the following exception", _breakReason)
+                        : new NpgsqlException("The connection is closed");
+                }  
+
                 if (!_userLock!.Wait(0))
                 {
                     var currentCommand = _currentCommand;
@@ -1578,6 +2032,7 @@ namespace Npgsql
                 case ConnectorState.Executing:
                 case ConnectorState.Fetching:
                 case ConnectorState.Waiting:
+                case ConnectorState.Replication:
                 case ConnectorState.Connecting:
                 case ConnectorState.Copy:
                     var currentCommand = _currentCommand;
@@ -1589,9 +2044,20 @@ namespace Npgsql
                 }
 
                 Debug.Assert(IsReady);
+
+                cancellationToken.ThrowIfCancellationRequested();
+
                 Log.Trace("Start user action", Id);
                 State = newState;
                 _currentCommand = command;
+
+                StartCancellableOperation(cancellationToken, attemptPgCancellation);
+
+                // We reset the UserTimeout for every user action, so it wouldn't leak from the previous query or action
+                // For example, we might have successfully cancelled the previous query (so the connection is not broken)
+                // But the next time, we call the Prepare, which doesn't set it's own timeout
+                UserTimeout = (command?.CommandTimeout ?? Settings.CommandTimeout) * 1000;
+
                 return new UserAction(this);
             }
         }
@@ -1599,6 +2065,8 @@ namespace Npgsql
         internal void EndUserAction()
         {
             Debug.Assert(CurrentReader == null);
+
+            _cancellationTokenRegistration.Dispose();
 
             if (_isKeepAliveEnabled)
             {
@@ -1633,12 +2101,7 @@ namespace Npgsql
         internal readonly struct UserAction : IDisposable
         {
             readonly NpgsqlConnector _connector;
-
-            internal UserAction(NpgsqlConnector connector)
-            {
-                _connector = connector;
-            }
-
+            internal UserAction(NpgsqlConnector connector) => _connector = connector;
             public void Dispose() => _connector.EndUserAction();
         }
 
@@ -1662,17 +2125,18 @@ namespace Npgsql
                 if (!IsReady)
                     return;
 
-                Log.Trace("Performed keepalive", Id);
-                WritePregenerated(PregeneratedMessages.KeepAlive);
+                Log.Trace("Performing keepalive", Id);
+                WriteSync(async: false);
                 Flush();
                 SkipUntil(BackendMessageCode.ReadyForQuery);
+                Log.Trace("Performed keepalive", Id);
             }
             catch (Exception e)
             {
                 Log.Error("Keepalive failure", e, Id);
                 try
                 {
-                    Break();
+                    Break(new NpgsqlException("Exception while sending a keepalive", e));
                 }
                 catch (Exception e2)
                 {
@@ -1690,206 +2154,78 @@ namespace Npgsql
 
         #region Wait
 
-        public bool Wait(int timeout)
+        internal async Task<bool> Wait(bool async, int timeout, CancellationToken cancellationToken = default)
         {
-            if ((timeout == 0 || timeout == -1) && IsSecure)
-                throw new NotSupportedException("Wait() with timeout isn't supported when SSL is used, see https://github.com/npgsql/npgsql/issues/1501");
+            using var _ = StartUserAction(ConnectorState.Waiting, cancellationToken: cancellationToken, attemptPgCancellation: false);
 
-            using (StartUserAction(ConnectorState.Waiting))
+            // We may have prepended messages in the connection's write buffer - these need to be flushed now.
+            await Flush(async, cancellationToken);
+
+            var keepaliveMs = Settings.KeepAlive * 1000;
+            while (true)
             {
-                // We may have prepended messages in the connection's write buffer - these need to be flushed now.
-                Flush();
+                cancellationToken.ThrowIfCancellationRequested();
 
-                var keepaliveMs = Settings.KeepAlive * 1000;
+                var timeoutForKeepalive = _isKeepAliveEnabled && (timeout <= 0 || keepaliveMs < timeout);
+                UserTimeout = timeoutForKeepalive ? keepaliveMs : timeout;
+                try
+                {
+                    var msg = await ReadMessageWithNotifications(async);
+                    if (msg != null)
+                    {
+                        throw Break(
+                            new NpgsqlException($"Received unexpected message of type {msg.Code} while waiting"));
+                    }
+                    return true;
+                }
+                catch (NpgsqlException e) when (e.InnerException is TimeoutException)
+                {
+                    if (!timeoutForKeepalive)  // We really timed out
+                        return false;
+                }
+
+                // Time for a keepalive
+                var keepaliveTime = Stopwatch.StartNew();
+                await WriteSync(async, cancellationToken);
+                await Flush(async, cancellationToken);
+
+                var receivedNotification = false;
+                var expectedMessageCode = BackendMessageCode.RowDescription;
+
                 while (true)
                 {
-                    var timeoutForKeepalive = _isKeepAliveEnabled && (timeout == 0 || timeout == -1 || keepaliveMs < timeout);
-                    UserTimeout = timeoutForKeepalive ? keepaliveMs : timeout;
+                    IBackendMessage? msg;
+
                     try
                     {
-                        var msg = ReadMessageWithNotifications(false).Result;
-                        if (msg != null)
-                        {
-                            Break();
-                            throw new NpgsqlException($"Received unexpected message of type {msg.Code} while waiting");
-                        }
-                        return true;
+                        msg = await ReadMessageWithNotifications(async);
                     }
-                    catch (TimeoutException)
+                    catch (Exception e) when (e is OperationCanceledException || e is NpgsqlException npgEx && npgEx.InnerException is TimeoutException)
                     {
-                        if (!timeoutForKeepalive)  // We really timed out
-                            return false;
+                        // We're somewhere in the middle of a reading keepalive messages
+                        // Breaking the connection, as we've lost protocol sync
+                        throw Break(e);
                     }
 
-                    // Time for a keepalive
-                    var keepaliveTime = Stopwatch.StartNew();
-                    WritePregenerated(PregeneratedMessages.KeepAlive);
-                    Flush();
-
-                    var receivedNotification = false;
-                    var expectedMessageCode = BackendMessageCode.RowDescription;
-
-                    while (true)
+                    if (msg == null)
                     {
-                        var msg = ReadMessage(false).Result;
-                        if (msg == null)
-                        {
-                            receivedNotification = true;
-                            continue;
-                        }
-
-                        if (msg.Code != expectedMessageCode)
-                            throw new NpgsqlException($"Received unexpected message of type {msg.Code} while expecting {expectedMessageCode} as part of keepalive");
-
-                        switch (msg.Code)
-                        {
-                        case BackendMessageCode.RowDescription:
-                            expectedMessageCode = BackendMessageCode.DataRow;
-                            continue;
-                        case BackendMessageCode.DataRow:
-                            // DataRow is usually consumed by a reader, here we have to skip it manually.
-                            ReadBuffer.Skip(((DataRowMessage)msg).Length);
-                            expectedMessageCode = BackendMessageCode.CompletedResponse;
-                            continue;
-                        case BackendMessageCode.CompletedResponse:
-                            expectedMessageCode = BackendMessageCode.ReadyForQuery;
-                            continue;
-                        case BackendMessageCode.ReadyForQuery:
-                            break;
-                        }
-                        Log.Trace("Performed keepalive", Id);
-
-                        if (receivedNotification)
-                            return true; // Notification was received during the keepalive
-                        break;
+                        receivedNotification = true;
+                        continue;
                     }
 
-                    if (timeout > 0)
-                        timeout -= (keepaliveMs + (int)keepaliveTime.ElapsedMilliseconds);
+                    if (msg.Code != BackendMessageCode.ReadyForQuery)
+                        throw new NpgsqlException($"Received unexpected message of type {msg.Code} while expecting {expectedMessageCode} as part of keepalive");
+
+                    Log.Trace("Performed keepalive", Id);
+
+                    if (receivedNotification)
+                        return true; // Notification was received during the keepalive
+                    cancellationToken.ThrowIfCancellationRequested();
+                    break;
                 }
-            }
-        }
 
-        public Task WaitAsync(CancellationToken cancellationToken)
-        {
-            using (NoSynchronizationContextScope.Enter())
-                return DoWaitAsync(cancellationToken);
-        }
-
-        async Task DoWaitAsync(CancellationToken cancellationToken)
-        {
-            var keepaliveSent = false;
-            var keepaliveLock = new SemaphoreSlim(1, 1);
-
-            TimerCallback performKeepaliveMethod = state =>
-            {
-                if (!keepaliveLock.Wait(0))
-                    return;
-                try
-                {
-                    if (keepaliveSent)
-                        return;
-                    keepaliveSent = true;
-                    WritePregenerated(PregeneratedMessages.KeepAlive);
-                    Flush();
-                }
-                finally
-                {
-                    keepaliveLock.Release();
-                }
-            };
-
-            using (StartUserAction(ConnectorState.Waiting))
-            using (cancellationToken.Register(() => performKeepaliveMethod(null)))
-            {
-                // We may have prepended messages in the connection's write buffer - these need to be flushed now.
-                Flush();
-
-                Timer? keepaliveTimer = null;
-                if (_isKeepAliveEnabled)
-                    keepaliveTimer = new Timer(performKeepaliveMethod, null, Settings.KeepAlive*1000, Timeout.Infinite);
-                try
-                {
-                    while (true)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        var msg = await ReadMessageWithNotifications(true);
-                        if (!keepaliveSent)
-                        {
-                            if (msg != null)
-                            {
-                                Break();
-                                throw new NpgsqlException($"Received unexpected message of type {msg.Code} while waiting");
-                            }
-                            return;
-                        }
-
-                        // A keepalive was sent. Consume the response (RowDescription, CommandComplete,
-                        // ReadyForQuery) while also keeping track if an async message was received in between.
-                        keepaliveLock.Wait();
-                        try
-                        {
-                            var receivedNotification = false;
-                            var expectedMessageCode = BackendMessageCode.RowDescription;
-
-                            while (true)
-                            {
-                                while (msg == null)
-                                {
-                                    receivedNotification = true;
-                                    msg = await ReadMessage(true);
-                                }
-
-                                if (msg.Code != expectedMessageCode)
-                                    throw new NpgsqlException($"Received unexpected message of type {msg.Code} while expecting {expectedMessageCode} as part of keepalive");
-
-                                var finishedKeepalive = false;
-                                switch (msg.Code)
-                                {
-                                case BackendMessageCode.RowDescription:
-                                    expectedMessageCode = BackendMessageCode.DataRow;
-                                    break;
-                                case BackendMessageCode.DataRow:
-                                    // DataRow is usually consumed by a reader, here we have to skip it manually.
-                                    await ReadBuffer.Skip(((DataRowMessage)msg).Length, true);
-                                    expectedMessageCode = BackendMessageCode.CompletedResponse;
-                                    break;
-                                case BackendMessageCode.CompletedResponse:
-                                    expectedMessageCode = BackendMessageCode.ReadyForQuery;
-                                    break;
-                                case BackendMessageCode.ReadyForQuery:
-                                    finishedKeepalive = true;
-                                    break;
-                                }
-
-                                if (!finishedKeepalive)
-                                {
-                                    msg = await ReadMessage(true);
-                                    continue;
-                                }
-
-                                Log.Trace("Performed keepalive", Id);
-
-                                if (receivedNotification)
-                                    return; // Notification was received during the keepalive
-
-                                cancellationToken.ThrowIfCancellationRequested();
-                                // Keepalive completed without notification, set up the next one and continue waiting
-                                keepaliveTimer!.Change(Settings.KeepAlive*1000, Timeout.Infinite);
-                                keepaliveSent = false;
-                                break;
-                            }
-                        }
-                        finally
-                        {
-                            keepaliveLock.Release();
-                        }
-                    }
-                }
-                finally
-                {
-                    keepaliveTimer?.Dispose();
-                }
+                if (timeout > 0)
+                    timeout -= (keepaliveMs + (int)keepaliveTime.ElapsedMilliseconds);
             }
         }
 
@@ -1904,8 +2240,6 @@ namespace Npgsql
         /// </summary>
         internal string Timezone { get; private set; } = default!;
 
-        bool IsRedshift => Settings.ServerCompatibilityMode == ServerCompatibilityMode.Redshift;
-
         #endregion Supported features and PostgreSQL settings
 
         #region Execute internal command
@@ -1913,24 +2247,24 @@ namespace Npgsql
         internal void ExecuteInternalCommand(string query)
             => ExecuteInternalCommand(query, false).GetAwaiter().GetResult();
 
-        internal async Task ExecuteInternalCommand(string query, bool async)
+        internal async Task ExecuteInternalCommand(string query, bool async, CancellationToken cancellationToken = default)
         {
             Log.Trace($"Executing internal command: {query}", Id);
 
-            await WriteQuery(query, async);
-            await Flush(async);
+            await WriteQuery(query, async, cancellationToken);
+            await Flush(async, cancellationToken);
             Expect<CommandCompleteMessage>(await ReadMessage(async), this);
             Expect<ReadyForQueryMessage>(await ReadMessage(async), this);
         }
 
-        internal async Task ExecuteInternalCommand(byte[] data, bool async)
+        internal async Task ExecuteInternalCommand(byte[] data, bool async, CancellationToken cancellationToken = default)
         {
             Debug.Assert(State != ConnectorState.Ready, "Forgot to start a user action...");
 
-            Log.Trace($"Executing internal pregenerated command", Id);
+            Log.Trace("Executing internal pregenerated command", Id);
 
-            await WritePregenerated(data, async);
-            await Flush(async);
+            await WritePregenerated(data, async, cancellationToken);
+            await Flush(async, cancellationToken);
             Expect<CommandCompleteMessage>(await ReadMessage(async), this);
             Expect<ReadyForQueryMessage>(await ReadMessage(async), this);
         }
@@ -1968,8 +2302,9 @@ namespace Npgsql
             switch (name)
             {
             case "standard_conforming_strings":
+                if (value != "on" && Settings.Multiplexing)
+                    throw Break(new NotSupportedException("standard_conforming_strings must be on with multiplexing"));
                 UseConformingStrings = value == "on";
-                SqlParser.StandardConformingStrings = UseConformingStrings;
                 return;
 
             case "TimeZone":
@@ -2028,6 +2363,11 @@ namespace Npgsql
         /// The connector is engaged in a COPY operation.
         /// </summary>
         Copy,
+
+        /// <summary>
+        /// The connector is engaged in streaming replication.
+        /// </summary>
+        Replication,
     }
 
 #pragma warning disable CA1717

@@ -42,27 +42,25 @@ namespace Npgsql.Tests
         [Test]
         public void TypeName()
         {
-            using (var conn = OpenConnection())
-            using (var cmd = new NpgsqlCommand("SELECT @p", conn))
-            {
-                var p1 = new NpgsqlParameter { ParameterName = "p", Value = 8, DataTypeName = "integer" };
-                cmd.Parameters.Add(p1);
-                Assert.That(cmd.ExecuteScalar(), Is.EqualTo(8));
-                // Purposefully try to send int as string, which should fail. This makes sure
-                // the above doesn't work simply because of type inference from the CLR type.
-                p1.DataTypeName = "text";
-                Assert.That(() => cmd.ExecuteScalar(), Throws.Exception.TypeOf<InvalidCastException>());
+            using var conn = OpenConnection();
+            using var cmd = new NpgsqlCommand("SELECT @p", conn);
+            var p1 = new NpgsqlParameter { ParameterName = "p", Value = 8, DataTypeName = "integer" };
+            cmd.Parameters.Add(p1);
+            Assert.That(cmd.ExecuteScalar(), Is.EqualTo(8));
+            // Purposefully try to send int as string, which should fail. This makes sure
+            // the above doesn't work simply because of type inference from the CLR type.
+            p1.DataTypeName = "text";
+            Assert.That(() => cmd.ExecuteScalar(), Throws.Exception.TypeOf<InvalidCastException>());
 
-                cmd.Parameters.Clear();
+            cmd.Parameters.Clear();
 
-                var p2 = new NpgsqlParameter<int> { ParameterName = "p", TypedValue = 8, DataTypeName = "integer" };
-                cmd.Parameters.Add(p2);
-                Assert.That(cmd.ExecuteScalar(), Is.EqualTo(8));
-                // Purposefully try to send int as string, which should fail. This makes sure
-                // the above doesn't work simply because of type inference from the CLR type.
-                p2.DataTypeName = "text";
-                Assert.That(() => cmd.ExecuteScalar(), Throws.Exception.TypeOf<InvalidCastException>());
-            }
+            var p2 = new NpgsqlParameter<int> { ParameterName = "p", TypedValue = 8, DataTypeName = "integer" };
+            cmd.Parameters.Add(p2);
+            Assert.That(cmd.ExecuteScalar(), Is.EqualTo(8));
+            // Purposefully try to send int as string, which should fail. This makes sure
+            // the above doesn't work simply because of type inference from the CLR type.
+            p2.DataTypeName = "text";
+            Assert.That(() => cmd.ExecuteScalar(), Throws.Exception.TypeOf<InvalidCastException>());
         }
 
         [Test]
@@ -207,6 +205,91 @@ namespace Npgsql.Tests
             //Assert.AreEqual ("database", p1.XmlSchemaCollectionDatabase, "XmlSchemaCollectionDatabase");
             //Assert.AreEqual ("name", p1.XmlSchemaCollectionName, "XmlSchemaCollectionName");
             //Assert.AreEqual ("schema", p1.XmlSchemaCollectionOwningSchema, "XmlSchemaCollectionOwningSchema");
+        }
+
+        [Test]
+        public void Clone()
+        {
+            var expected = new NpgsqlParameter
+            {
+                Value = 42,
+                ParameterName = "TheAnswer",
+
+                DbType = DbType.Int32,
+                NpgsqlDbType = NpgsqlDbType.Integer,
+                DataTypeName = "integer",
+
+                Direction = ParameterDirection.InputOutput,
+                IsNullable = true,
+                Precision = 1,
+                Scale = 2,
+                Size = 4,
+
+                SourceVersion = DataRowVersion.Proposed,
+                SourceColumn = "source",
+                SourceColumnNullMapping = true,
+            };
+            var actual = expected.Clone();
+
+            Assert.AreEqual(expected.Value, actual.Value);
+            Assert.AreEqual(expected.ParameterName, actual.ParameterName);
+
+            Assert.AreEqual(expected.DbType, actual.DbType);
+            Assert.AreEqual(expected.NpgsqlDbType, actual.NpgsqlDbType);
+            Assert.AreEqual(expected.DataTypeName, actual.DataTypeName);
+
+            Assert.AreEqual(expected.Direction, actual.Direction);
+            Assert.AreEqual(expected.IsNullable, actual.IsNullable);
+            Assert.AreEqual(expected.Precision, actual.Precision);
+            Assert.AreEqual(expected.Scale, actual.Scale);
+            Assert.AreEqual(expected.Size, actual.Size);
+
+            Assert.AreEqual(expected.SourceVersion, actual.SourceVersion);
+            Assert.AreEqual(expected.SourceColumn, actual.SourceColumn);
+            Assert.AreEqual(expected.SourceColumnNullMapping, actual.SourceColumnNullMapping);
+        }
+
+        [Test]
+        public void CloneGeneric()
+        {
+            var expected = new NpgsqlParameter<int>
+            {
+                TypedValue = 42,
+                ParameterName = "TheAnswer",
+
+                DbType = DbType.Int32,
+                NpgsqlDbType = NpgsqlDbType.Integer,
+                DataTypeName = "integer",
+
+                Direction = ParameterDirection.InputOutput,
+                IsNullable = true,
+                Precision = 1,
+                Scale = 2,
+                Size = 4,
+
+                SourceVersion = DataRowVersion.Proposed,
+                SourceColumn ="source",
+                SourceColumnNullMapping = true,
+            };
+            var actual = (NpgsqlParameter<int>)expected.Clone();
+
+            Assert.AreEqual(expected.Value, actual.Value);
+            Assert.AreEqual(expected.TypedValue, actual.TypedValue);
+            Assert.AreEqual(expected.ParameterName, actual.ParameterName);
+
+            Assert.AreEqual(expected.DbType, actual.DbType);
+            Assert.AreEqual(expected.NpgsqlDbType, actual.NpgsqlDbType);
+            Assert.AreEqual(expected.DataTypeName, actual.DataTypeName);
+
+            Assert.AreEqual(expected.Direction, actual.Direction);
+            Assert.AreEqual(expected.IsNullable, actual.IsNullable);
+            Assert.AreEqual(expected.Precision, actual.Precision);
+            Assert.AreEqual(expected.Scale, actual.Scale);
+            Assert.AreEqual(expected.Size, actual.Size);
+
+            Assert.AreEqual(expected.SourceVersion, actual.SourceVersion);
+            Assert.AreEqual(expected.SourceColumn, actual.SourceColumn);
+            Assert.AreEqual(expected.SourceColumnNullMapping, actual.SourceColumnNullMapping);
         }
 
         #endregion
@@ -650,32 +733,30 @@ namespace Npgsql.Tests
         [Test]
         public void ParameterCollectionHashLookupParameterRenameBug()
         {
-            using (var command = new NpgsqlCommand())
+            using var command = new NpgsqlCommand();
+            // Put plenty of parameters in the collection to turn on hash lookup functionality.
+            for (var i = 0; i < 10; i++)
             {
-                // Put plenty of parameters in the collection to turn on hash lookup functionality.
-                for (var i = 0; i < 10; i++)
-                {
-                    command.Parameters.AddWithValue(string.Format("p{0:00}", i + 1), NpgsqlDbType.Text, string.Format("String parameter value {0}", i + 1));
-                }
+                command.Parameters.AddWithValue(string.Format("p{0:00}", i + 1), NpgsqlDbType.Text, string.Format("String parameter value {0}", i + 1));
+            }
 
-                // Make sure both hash lookups have been generated.
-                Assert.AreEqual(command.Parameters["p03"].ParameterName, "p03");
-                Assert.AreEqual(command.Parameters["P03"].ParameterName, "p03");
+            // Make sure both hash lookups have been generated.
+            Assert.AreEqual(command.Parameters["p03"].ParameterName, "p03");
+            Assert.AreEqual(command.Parameters["P03"].ParameterName, "p03");
 
-                // Rename the target parameter.
-                command.Parameters["p03"].ParameterName = "a_new_name";
+            // Rename the target parameter.
+            command.Parameters["p03"].ParameterName = "a_new_name";
 
-                try
-                {
-                    // Try to exploit the hash lookup bug.
-                    // If the bug exists, the hash lookups will be out of sync with the list, and be unable
-                    // to find the parameter by its new name.
-                    Assert.IsTrue(command.Parameters.IndexOf("a_new_name") >= 0);
-                }
-                catch (Exception e)
-                {
-                    throw new Exception("NpgsqlParameterCollection hash lookup/parameter rename bug detected", e);
-                }
+            try
+            {
+                // Try to exploit the hash lookup bug.
+                // If the bug exists, the hash lookups will be out of sync with the list, and be unable
+                // to find the parameter by its new name.
+                Assert.IsTrue(command.Parameters.IndexOf("a_new_name") >= 0);
+            }
+            catch (Exception e)
+            {
+                throw new Exception("NpgsqlParameterCollection hash lookup/parameter rename bug detected", e);
             }
         }
 

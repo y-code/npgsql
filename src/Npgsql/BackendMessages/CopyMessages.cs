@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using Npgsql.Internal;
 using Npgsql.Util;
 
 namespace Npgsql.BackendMessages
@@ -88,7 +89,7 @@ namespace Npgsql.BackendMessages
     class CopyDoneMessage : IBackendMessage
     {
         public BackendMessageCode Code => BackendMessageCode.CopyDone;
-        internal static readonly CopyDoneMessage Instance = new CopyDoneMessage();
+        internal static readonly CopyDoneMessage Instance = new();
         CopyDoneMessage() { }
     }
 }

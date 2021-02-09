@@ -20,7 +20,9 @@ namespace Npgsql.NameTranslation
         /// <summary>
         /// Creates a new <see cref="NpgsqlSnakeCaseNameTranslator"/>.
         /// </summary>
-        /// <param name="legacyMode">Uses the legacy naming convention if <c>true</c>, otherwise it uses the new naming convention.</param>
+        /// <param name="legacyMode">
+        /// Uses the legacy naming convention if <see langword="true"/>, otherwise it uses the new naming convention.
+        /// </param>
         public NpgsqlSnakeCaseNameTranslator(bool legacyMode)
             => LegacyMode = legacyMode;
 
@@ -47,22 +49,22 @@ namespace Npgsql.NameTranslation
         /// <summary>
         /// Converts a string to its snake_case equivalent.
         /// </summary>
-        /// <param name="value">The value to convert.</param>
-        public static string ConvertToSnakeCase(string value)
+        /// <param name="name">The value to convert.</param>
+        public static string ConvertToSnakeCase(string name)
         {
-            const char underscore = '_';
-            const UnicodeCategory noneCategory = UnicodeCategory.Control;
+            if (string.IsNullOrEmpty(name))
+                return name;
 
-            var builder = new StringBuilder();
-            var previousCategory = noneCategory;
+            var builder = new StringBuilder(name.Length + Math.Min(2, name.Length / 5));
+            var previousCategory = default(UnicodeCategory?);
 
-            for (var currentIndex = 0; currentIndex< value.Length; currentIndex++)
+            for (var currentIndex = 0; currentIndex < name.Length; currentIndex++)
             {
-                var currentChar = value[currentIndex];
-                if (currentChar == underscore)
+                var currentChar = name[currentIndex];
+                if (currentChar == '_')
                 {
-                    builder.Append(underscore);
-                    previousCategory = noneCategory;
+                    builder.Append('_');
+                    previousCategory = null;
                     continue;
                 }
 
@@ -74,11 +76,12 @@ namespace Npgsql.NameTranslation
                         if (previousCategory == UnicodeCategory.SpaceSeparator ||
                             previousCategory == UnicodeCategory.LowercaseLetter ||
                             previousCategory != UnicodeCategory.DecimalDigitNumber &&
+                            previousCategory != null &&
                             currentIndex > 0 &&
-                            currentIndex + 1 < value.Length &&
-                            char.IsLower(value[currentIndex + 1]))
+                            currentIndex + 1 < name.Length &&
+                            char.IsLower(name[currentIndex + 1]))
                         {
-                            builder.Append(underscore);
+                            builder.Append('_');
                         }
 
                         currentChar = char.ToLower(currentChar);
@@ -87,11 +90,11 @@ namespace Npgsql.NameTranslation
                     case UnicodeCategory.LowercaseLetter:
                     case UnicodeCategory.DecimalDigitNumber:
                         if (previousCategory == UnicodeCategory.SpaceSeparator)
-                            builder.Append(underscore);
+                            builder.Append('_');
                         break;
 
                     default:
-                        if (previousCategory != noneCategory)
+                        if (previousCategory != null)
                             previousCategory = UnicodeCategory.SpaceSeparator;
                         continue;
                 }

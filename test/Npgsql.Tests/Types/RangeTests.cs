@@ -2,133 +2,108 @@
 using System.ComponentModel;
 using System.Data;
 using System.Globalization;
+using System.Threading.Tasks;
 using NpgsqlTypes;
 using NUnit.Framework;
 
 namespace Npgsql.Tests.Types
 {
     /// <remarks>
-    /// http://www.postgresql.org/docs/current/static/rangetypes.html
+    /// https://www.postgresql.org/docs/current/static/rangetypes.html
     /// </remarks>
-    class RangeTests : TestBase
+    class RangeTests : MultiplexingTestBase
     {
         [Test, NUnit.Framework.Description("Resolves a range type handler via the different pathways")]
-        public void RangeTypeResolution()
+        public async Task RangeTypeResolution()
         {
+            if (IsMultiplexing)
+                Assert.Ignore("Multiplexing, ReloadTypes");
+
             var csb = new NpgsqlConnectionStringBuilder(ConnectionString)
             {
                 ApplicationName = nameof(RangeTypeResolution), // Prevent backend type caching in TypeHandlerRegistry
                 Pooling = false
             };
 
-            using (var conn = OpenConnection(csb))
+            using var conn = await OpenConnectionAsync(csb);
+            // Resolve type by NpgsqlDbType
+            using (var cmd = new NpgsqlCommand("SELECT @p", conn))
             {
-                // Resolve type by NpgsqlDbType
-                using (var cmd = new NpgsqlCommand("SELECT @p", conn))
-                {
-                    cmd.Parameters.AddWithValue("p", NpgsqlDbType.Range | NpgsqlDbType.Integer, DBNull.Value);
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        reader.Read();
-                        Assert.That(reader.GetDataTypeName(0), Is.EqualTo("int4range"));
-                    }
-                }
-
-                // Resolve type by ClrType (type inference)
-                conn.ReloadTypes();
-                using (var cmd = new NpgsqlCommand("SELECT @p", conn))
-                {
-                    cmd.Parameters.Add(new NpgsqlParameter { ParameterName = "p", Value = new NpgsqlRange<int>(3, 5) });
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        reader.Read();
-                        Assert.That(reader.GetDataTypeName(0), Is.EqualTo("int4range"));
-                    }
-                }
-
-                // Resolve type by OID (read)
-                conn.ReloadTypes();
-                using (var cmd = new NpgsqlCommand("SELECT int4range(3, 5)", conn))
-                using (var reader = cmd.ExecuteReader())
+                cmd.Parameters.AddWithValue("p", NpgsqlDbType.Range | NpgsqlDbType.Integer, DBNull.Value);
+                using (var reader = await cmd.ExecuteReaderAsync())
                 {
                     reader.Read();
                     Assert.That(reader.GetDataTypeName(0), Is.EqualTo("int4range"));
                 }
             }
-        }
 
-        [Test]
-        public void Range()
-        {
-            using (var conn = OpenConnection())
-            using (var cmd = new NpgsqlCommand("SELECT @p1, @p2, @p3, @p4", conn))
+            // Resolve type by ClrType (type inference)
+            conn.ReloadTypes();
+            using (var cmd = new NpgsqlCommand("SELECT @p", conn))
             {
-                var p1 = new NpgsqlParameter("p1", NpgsqlDbType.Range | NpgsqlDbType.Integer) { Value = NpgsqlRange<int>.Empty };
-                var p2 = new NpgsqlParameter { ParameterName = "p2", Value = new NpgsqlRange<int>(1, 10) };
-                var p3 = new NpgsqlParameter { ParameterName = "p3", Value = new NpgsqlRange<int>(1, false, 10, false) };
-                var p4 = new NpgsqlParameter { ParameterName = "p4", Value = new NpgsqlRange<int>(0, false, true, 10, false, false) };
-                Assert.That(p2.NpgsqlDbType, Is.EqualTo(NpgsqlDbType.Range | NpgsqlDbType.Integer));
-                cmd.Parameters.Add(p1);
-                cmd.Parameters.Add(p2);
-                cmd.Parameters.Add(p3);
-                cmd.Parameters.Add(p4);
-                using (var reader = cmd.ExecuteReader())
+                cmd.Parameters.Add(new NpgsqlParameter { ParameterName = "p", Value = new NpgsqlRange<int>(3, 5) });
+                using (var reader = await cmd.ExecuteReaderAsync())
                 {
                     reader.Read();
-
-                    Assert.That(reader[0].ToString(), Is.EqualTo("empty"));
-                    Assert.That(reader[1].ToString(), Is.EqualTo("[1,11)"));
-                    Assert.That(reader[2].ToString(), Is.EqualTo("[2,10)"));
-                    Assert.That(reader[3].ToString(), Is.EqualTo("(,10)"));
+                    Assert.That(reader.GetDataTypeName(0), Is.EqualTo("int4range"));
                 }
+            }
+
+            // Resolve type by OID (read)
+            conn.ReloadTypes();
+            using (var cmd = new NpgsqlCommand("SELECT int4range(3, 5)", conn))
+            using (var reader = await cmd.ExecuteReaderAsync())
+            {
+                reader.Read();
+                Assert.That(reader.GetDataTypeName(0), Is.EqualTo("int4range"));
             }
         }
 
         [Test]
-        public void RangeWithLongSubtype()
+        public async Task Range()
         {
-            using (var conn = OpenConnection())
-            {
-                conn.ExecuteNonQuery("CREATE TYPE pg_temp.textrange AS RANGE(subtype=text)");
-                conn.ReloadTypes();
-                Assert.That(conn.ExecuteScalar("SELECT 1"), Is.EqualTo(1));
+            using var conn = await OpenConnectionAsync();
+            using var cmd = new NpgsqlCommand("SELECT @p1, @p2, @p3, @p4", conn);
+            var p1 = new NpgsqlParameter("p1", NpgsqlDbType.Range | NpgsqlDbType.Integer) { Value = NpgsqlRange<int>.Empty };
+            var p2 = new NpgsqlParameter { ParameterName = "p2", Value = new NpgsqlRange<int>(1, 10) };
+            var p3 = new NpgsqlParameter { ParameterName = "p3", Value = new NpgsqlRange<int>(1, false, 10, false) };
+            var p4 = new NpgsqlParameter { ParameterName = "p4", Value = new NpgsqlRange<int>(0, false, true, 10, false, false) };
+            Assert.That(p2.NpgsqlDbType, Is.EqualTo(NpgsqlDbType.Range | NpgsqlDbType.Integer));
+            cmd.Parameters.Add(p1);
+            cmd.Parameters.Add(p2);
+            cmd.Parameters.Add(p3);
+            cmd.Parameters.Add(p4);
+            using var reader = await cmd.ExecuteReaderAsync();
+            reader.Read();
 
-                var value = new NpgsqlRange<string>(
-                    new string('a', conn.Settings.WriteBufferSize + 10),
-                    new string('z', conn.Settings.WriteBufferSize + 10)
-                );
-
-                //var value = new NpgsqlRange<string>("bar", "foo");
-                using (var cmd = new NpgsqlCommand("SELECT @p", conn))
-                {
-                    cmd.Parameters.Add(new NpgsqlParameter("p", NpgsqlDbType.Range | NpgsqlDbType.Text) { Value = value });
-                    using (var reader = cmd.ExecuteReader(CommandBehavior.SequentialAccess))
-                    {
-                        reader.Read();
-                        Assert.That(reader[0], Is.EqualTo(value));
-                    }
-                }
-            }
+            Assert.That(reader[0].ToString(), Is.EqualTo("empty"));
+            Assert.That(reader[1].ToString(), Is.EqualTo("[1,11)"));
+            Assert.That(reader[2].ToString(), Is.EqualTo("[2,10)"));
+            Assert.That(reader[3].ToString(), Is.EqualTo("(,10)"));
         }
 
         [Test]
-        public void TestRange()
+        public async Task RangeWithLongSubtype()
         {
-            using (var conn = OpenConnection())
-            using (var cmd = conn.CreateCommand())
-            {
-                object obj;
+            if (IsMultiplexing)
+                Assert.Ignore("Multiplexing, ReloadTypes");
 
-                cmd.CommandText = "select '[2,10)'::int4range";
-                cmd.Prepare();
-                obj = cmd.ExecuteScalar();
-                Assert.AreEqual(new NpgsqlRange<int>(2, true, false, 10, false, false), obj);
+            using var conn = await OpenConnectionAsync();
+            await conn.ExecuteNonQueryAsync("CREATE TYPE pg_temp.textrange AS RANGE(subtype=text)");
+            conn.ReloadTypes();
+            Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
 
-                cmd.CommandText = "select array['[2,10)'::int4range, '[3,9)'::int4range]";
-                cmd.Prepare();
-                obj = cmd.ExecuteScalar();
-                Assert.AreEqual(new NpgsqlRange<int>(3, true, false, 9, false, false), ((NpgsqlRange<int>[])obj)[1]);
-            }
+            var value = new NpgsqlRange<string>(
+                new string('a', conn.Settings.WriteBufferSize + 10),
+                new string('z', conn.Settings.WriteBufferSize + 10)
+            );
+
+            //var value = new NpgsqlRange<string>("bar", "foo");
+            using var cmd = new NpgsqlCommand("SELECT @p", conn);
+            cmd.Parameters.Add(new NpgsqlParameter("p", NpgsqlDbType.Range | NpgsqlDbType.Text) { Value = value });
+            using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess);
+            reader.Read();
+            Assert.That(reader[0], Is.EqualTo(value));
         }
 
         [Test]
@@ -210,11 +185,30 @@ namespace Npgsql.Tests.Types
             Assert.AreNotEqual(b.GetHashCode(), c.GetHashCode());
         }
 
-        [OneTimeSetUp]
-        public void OneTimeSetUp()
+        [Test]
+        public async Task TimestampTzRangeWithDateTimeOffset()
         {
-            using (var conn = OpenConnection())
-                TestUtil.MinimumPgVersion(conn, "9.2.0");
+            // The default CLR mapping for timestamptz is DateTime, but it also supports DateTimeOffset.
+            // The range should also support both, defaulting to the first.
+            using var conn = await OpenConnectionAsync();
+            using var cmd = new NpgsqlCommand("SELECT @p", conn);
+
+            var dto1 = new DateTimeOffset(2010, 1, 3, 10, 0, 0, TimeSpan.Zero);
+            var dto2 = new DateTimeOffset(2010, 1, 4, 10, 0, 0, TimeSpan.Zero);
+            var range = new NpgsqlRange<DateTimeOffset>(dto1, dto2);
+            cmd.Parameters.AddWithValue("p", range);
+            using var reader = await cmd.ExecuteReaderAsync();
+
+            await reader.ReadAsync();
+            var actual = reader.GetFieldValue<NpgsqlRange<DateTimeOffset>>(0);
+            Assert.That(actual, Is.EqualTo(range));
+        }
+
+        [OneTimeSetUp]
+        public async Task OneTimeSetUp()
+        {
+            using var conn = await OpenConnectionAsync();
+            TestUtil.MinimumPgVersion(conn, "9.2.0");
         }
 
         #region ParseTests
@@ -425,5 +419,7 @@ namespace Npgsql.Tests.Types
             };
 
         #endregion
+
+        public RangeTests(MultiplexingMode multiplexingMode) : base(multiplexingMode) {}
     }
 }

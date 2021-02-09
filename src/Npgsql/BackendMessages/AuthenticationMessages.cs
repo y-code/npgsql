@@ -1,4 +1,5 @@
 ﻿using System.Collections.Generic;
+using Npgsql.Internal;
 using Npgsql.Logging;
 using Npgsql.Util;
 
@@ -14,7 +15,7 @@ namespace Npgsql.BackendMessages
     {
         internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationOk;
 
-        internal static readonly AuthenticationOkMessage Instance = new AuthenticationOkMessage();
+        internal static readonly AuthenticationOkMessage Instance = new();
         AuthenticationOkMessage() { }
     }
 
@@ -22,7 +23,7 @@ namespace Npgsql.BackendMessages
     {
         internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationKerberosV5;
 
-        internal static readonly AuthenticationKerberosV5Message Instance = new AuthenticationKerberosV5Message();
+        internal static readonly AuthenticationKerberosV5Message Instance = new();
         AuthenticationKerberosV5Message() { }
     }
 
@@ -30,7 +31,7 @@ namespace Npgsql.BackendMessages
     {
         internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationCleartextPassword;
 
-        internal static readonly AuthenticationCleartextPasswordMessage Instance = new AuthenticationCleartextPasswordMessage();
+        internal static readonly AuthenticationCleartextPasswordMessage Instance = new();
         AuthenticationCleartextPasswordMessage() { }
     }
 
@@ -57,7 +58,7 @@ namespace Npgsql.BackendMessages
     {
         internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationSCMCredential;
 
-        internal static readonly AuthenticationSCMCredentialMessage Instance = new AuthenticationSCMCredentialMessage();
+        internal static readonly AuthenticationSCMCredentialMessage Instance = new();
         AuthenticationSCMCredentialMessage() { }
     }
 
@@ -65,7 +66,7 @@ namespace Npgsql.BackendMessages
     {
         internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationGSS;
 
-        internal static readonly AuthenticationGSSMessage Instance = new AuthenticationGSSMessage();
+        internal static readonly AuthenticationGSSMessage Instance = new();
         AuthenticationGSSMessage() { }
     }
 
@@ -93,7 +94,7 @@ namespace Npgsql.BackendMessages
     {
         internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationSSPI;
 
-        internal static readonly AuthenticationSSPIMessage Instance = new AuthenticationSSPIMessage();
+        internal static readonly AuthenticationSSPIMessage Instance = new();
         AuthenticationSSPIMessage() { }
     }
 
@@ -102,7 +103,7 @@ namespace Npgsql.BackendMessages
     class AuthenticationSASLMessage : AuthenticationRequestMessage
     {
         internal override AuthenticationRequestType AuthRequestType => AuthenticationRequestType.AuthenticationSASL;
-        internal List<string> Mechanisms { get; } = new List<string>();
+        internal List<string> Mechanisms { get; } = new();
 
         internal AuthenticationSASLMessage(NpgsqlReadBuffer buf)
         {

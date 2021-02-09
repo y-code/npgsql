@@ -1,9 +1,9 @@
-﻿using System;
+using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Threading;
 using System.Threading.Tasks;
-using JetBrains.Annotations;
 using Npgsql.BackendMessages;
+using Npgsql.Internal;
 using Npgsql.Logging;
 using NpgsqlTypes;
 using static Npgsql.Util.Statics;
@@ -12,10 +12,10 @@ namespace Npgsql
 {
     /// <summary>
     /// Provides an API for a binary COPY FROM operation, a high-performance data import mechanism to
-    /// a PostgreSQL table. Initiated by <see cref="NpgsqlConnection.BeginBinaryImport"/>
+    /// a PostgreSQL table. Initiated by <see cref="NpgsqlConnection.BeginBinaryImport(string)"/>
     /// </summary>
     /// <remarks>
-    /// See http://www.postgresql.org/docs/current/static/sql-copy.html.
+    /// See https://www.postgresql.org/docs/current/static/sql-copy.html.
     /// </remarks>
     public sealed class NpgsqlBinaryImporter : ICancelable, IAsyncDisposable
     {
@@ -34,46 +34,66 @@ namespace Npgsql
         /// <summary>
         /// The number of columns, as returned from the backend in the CopyInResponse.
         /// </summary>
-        internal int NumColumns { get; }
+        internal int NumColumns { get; private set; }
 
         bool InMiddleOfRow => _column != -1 && _column != NumColumns;
 
-        readonly NpgsqlParameter?[] _params;
+        NpgsqlParameter?[] _params;
 
         static readonly NpgsqlLogger Log = NpgsqlLogManager.CreateLogger(nameof(NpgsqlBinaryImporter));
+
+        /// <summary>
+        /// Current timeout
+        /// </summary>
+        public TimeSpan Timeout
+        {
+            set
+            {
+                _buf.Timeout = value;
+                // While calling Complete(), we're using the connector, which overwrites the buffer's timeout with it's own
+                _connector.UserTimeout = (int)value.TotalMilliseconds;
+            }
+        }
 
         #endregion
 
         #region Construction / Initialization
 
-        internal NpgsqlBinaryImporter(NpgsqlConnector connector, string copyFromCommand)
+        internal NpgsqlBinaryImporter(NpgsqlConnector connector)
         {
             _connector = connector;
             _buf = connector.WriteBuffer;
             _column = -1;
+            _params = null!;
+        }
 
-            _connector.WriteQuery(copyFromCommand);
-            _connector.Flush();
+        internal async Task Init(string copyFromCommand, bool async, CancellationToken cancellationToken = default)
+        {
+            await _connector.WriteQuery(copyFromCommand, async, cancellationToken);
+            await _connector.Flush(async, cancellationToken);
+
+            using var registration = _connector.StartNestedCancellableOperation(cancellationToken, attemptPgCancellation: false);
 
             CopyInResponseMessage copyInResponse;
-            var msg = _connector.ReadMessage();
+            var msg = await _connector.ReadMessage(async);
             switch (msg.Code)
             {
-                case BackendMessageCode.CopyInResponse:
-                    copyInResponse = (CopyInResponseMessage)msg;
-                    if (!copyInResponse.IsBinary)
-                    {
-                        _connector.Break();
-                        throw new ArgumentException("copyFromCommand triggered a text transfer, only binary is allowed", nameof(copyFromCommand));
-                    }
-                    break;
-                case BackendMessageCode.CompletedResponse:
-                    throw new InvalidOperationException(
-                        "This API only supports import/export from the client, i.e. COPY commands containing TO/FROM STDIN. " +
-                        "To import/export with files on your PostgreSQL machine, simply execute the command with ExecuteNonQuery. " +
-                        "Note that your data has been successfully imported/exported.");
-                default:
-                    throw _connector.UnexpectedMessageReceived(msg.Code);
+            case BackendMessageCode.CopyInResponse:
+                copyInResponse = (CopyInResponseMessage) msg;
+                if (!copyInResponse.IsBinary)
+                {
+                    throw _connector.Break(
+                        new ArgumentException("copyFromCommand triggered a text transfer, only binary is allowed",
+                            nameof(copyFromCommand)));
+                }
+                break;
+            case BackendMessageCode.CommandComplete:
+                throw new InvalidOperationException(
+                    "This API only supports import/export from the client, i.e. COPY commands containing TO/FROM STDIN. " +
+                    "To import/export with files on your PostgreSQL machine, simply execute the command with ExecuteNonQuery. " +
+                    "Note that your data has been successfully imported/exported.");
+            default:
+                throw _connector.UnexpectedMessageReceived(msg.Code);
             }
 
             NumColumns = copyInResponse.NumColumns;
@@ -106,21 +126,30 @@ namespace Npgsql
             if (cancellationToken.IsCancellationRequested)
                 return Task.FromCanceled(cancellationToken);
             using (NoSynchronizationContextScope.Enter())
-                return StartRow(true);
+                return StartRow(true, cancellationToken);
         }
 
-        async Task StartRow(bool async)
+        async Task StartRow(bool async, CancellationToken cancellationToken = default)
         {
             CheckReady();
 
             if (_column != -1 && _column != NumColumns)
-                throw new InvalidOperationException("Row has already been started and must be finished");
+                ThrowHelper.ThrowInvalidOperationException_BinaryImportParametersMismatch(NumColumns, _column);
 
-            if (_buf.WriteSpaceLeft < 2)
-                await _buf.Flush(async);
-            _buf.WriteInt16(NumColumns);
+            try
+            {
+                if (_buf.WriteSpaceLeft < 2)
+                    await _buf.Flush(async, cancellationToken);
+                _buf.WriteInt16(NumColumns);
 
-            _column = 0;
+                _column = 0;
+            }
+            catch
+            {
+                // An exception here will have already broken the connection etc.
+                Cleanup();
+                throw;
+            }
         }
 
         /// <summary>
@@ -138,7 +167,9 @@ namespace Npgsql
         /// Writes a single column in the current row.
         /// </summary>
         /// <param name="value">The value to be written</param>
-        /// <param name="cancellationToken"></param>
+        /// <param name="cancellationToken">
+        /// An optional token to cancel the asynchronous operation. The default value is <see cref="CancellationToken.None"/>.
+        /// </param>
         /// <typeparam name="T">
         /// The type of the column to be written. This must correspond to the actual type or data
         /// corruption will occur. If in doubt, use <see cref="Write{T}(T, NpgsqlDbType)"/> to manually
@@ -149,11 +180,13 @@ namespace Npgsql
             if (cancellationToken.IsCancellationRequested)
                 return Task.FromCanceled(cancellationToken);
             using (NoSynchronizationContextScope.Enter())
-                return Write(value, true);
+                return Write(value, true, cancellationToken);
         }
 
-        Task Write<T>([AllowNull] T value, bool async)
+        Task Write<T>([AllowNull] T value, bool async, CancellationToken cancellationToken = default)
         {
+            CheckColumnIndex();
+
             var p = _params[_column];
             if (p == null)
             {
@@ -163,7 +196,7 @@ namespace Npgsql
                     : new NpgsqlParameter<T>();
             }
 
-            return Write(value, p, async);
+            return Write(value, p, async, cancellationToken);
         }
 
         /// <summary>
@@ -190,18 +223,22 @@ namespace Npgsql
         /// the JSONB type, for which <typeparamref name="T"/> will be a simple string but for which
         /// <paramref name="npgsqlDbType"/> must be specified as <see cref="NpgsqlDbType.Jsonb"/>.
         /// </param>
-        /// <param name="cancellationToken"></param>
+        /// <param name="cancellationToken">
+        /// An optional token to cancel the asynchronous operation. The default value is <see cref="CancellationToken.None"/>.
+        /// </param>
         /// <typeparam name="T">The .NET type of the column to be written.</typeparam>
         public Task WriteAsync<T>([AllowNull] T value, NpgsqlDbType npgsqlDbType, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
                 return Task.FromCanceled(cancellationToken);
             using (NoSynchronizationContextScope.Enter())
-                return Write(value, npgsqlDbType, true);
+                return Write(value, npgsqlDbType, true, cancellationToken);
         }
 
-        Task Write<T>([AllowNull] T value, NpgsqlDbType npgsqlDbType, bool async)
+        Task Write<T>([AllowNull] T value, NpgsqlDbType npgsqlDbType, bool async, CancellationToken cancellationToken = default)
         {
+            CheckColumnIndex();
+
             var p = _params[_column];
             if (p == null)
             {
@@ -215,7 +252,7 @@ namespace Npgsql
             if (npgsqlDbType != p.NpgsqlDbType)
                 throw new InvalidOperationException($"Can't change {nameof(p.NpgsqlDbType)} from {p.NpgsqlDbType} to {npgsqlDbType}");
 
-            return Write(value, p, async);
+            return Write(value, p, async, cancellationToken);
         }
 
         /// <summary>
@@ -238,18 +275,22 @@ namespace Npgsql
         /// In some cases <typeparamref name="T"/> isn't enough to infer the data type to be written to
         /// the database. This parameter and be used to unambiguously specify the type.
         /// </param>
-        /// <param name="cancellationToken"></param>
+        /// <param name="cancellationToken">
+        /// An optional token to cancel the asynchronous operation. The default value is <see cref="CancellationToken.None"/>.
+        /// </param>
         /// <typeparam name="T">The .NET type of the column to be written.</typeparam>
         public Task WriteAsync<T>([AllowNull] T value, string dataTypeName, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
                 return Task.FromCanceled(cancellationToken);
             using (NoSynchronizationContextScope.Enter())
-                return Write(value, dataTypeName, true);
+                return Write(value, dataTypeName, true, cancellationToken);
         }
 
-        Task Write<T>([AllowNull] T value, string dataTypeName, bool async)
+        Task Write<T>([AllowNull] T value, string dataTypeName, bool async, CancellationToken cancellationToken = default)
         {
+            CheckColumnIndex();
+
             var p = _params[_column];
             if (p == null)
             {
@@ -263,10 +304,10 @@ namespace Npgsql
             //if (dataTypeName!= p.DataTypeName)
             //    throw new InvalidOperationException($"Can't change {nameof(p.DataTypeName)} from {p.DataTypeName} to {dataTypeName}");
 
-            return Write(value, p, async);
+            return Write(value, p, async, cancellationToken);
         }
 
-        async Task Write<T>([AllowNull] T value, NpgsqlParameter param, bool async)
+        async Task Write<T>([AllowNull] T value, NpgsqlParameter param, bool async, CancellationToken cancellationToken = default)
         {
             CheckReady();
             if (_column == -1)
@@ -274,29 +315,38 @@ namespace Npgsql
 
             if (value == null || value is DBNull)
             {
-                await WriteNull(async);
+                await WriteNull(async, cancellationToken);
                 return;
             }
 
-            if (typeof(T) == typeof(object))
+            try
             {
-                param.Value = value;
-            }
-            else
-            {
-                if (!(param is NpgsqlParameter<T> typedParam))
+                if (typeof(T) == typeof(object))
                 {
-                    _params[_column] = typedParam = new NpgsqlParameter<T>();
-                    typedParam.NpgsqlDbType = param.NpgsqlDbType;
+                    param.Value = value;
                 }
-                typedParam.TypedValue = value;
+                else
+                {
+                    if (!(param is NpgsqlParameter<T> typedParam))
+                    {
+                        _params[_column] = typedParam = new NpgsqlParameter<T>();
+                        typedParam.NpgsqlDbType = param.NpgsqlDbType;
+                    }
+                    typedParam.TypedValue = value;
+                }
+                param.ResolveHandler(_connector.TypeMapper);
+                param.ValidateAndGetLength();
+                param.LengthCache?.Rewind();
+                await param.WriteWithLength(_buf, async, cancellationToken);
+                param.LengthCache?.Clear();
+                _column++;
             }
-            param.ResolveHandler(_connector.TypeMapper);
-            param.ValidateAndGetLength();
-            param.LengthCache?.Rewind();
-            await param.WriteWithLength(_buf, async);
-            param.LengthCache?.Clear();
-            _column++;
+            catch
+            {
+                // An exception here will have already broken the connection etc.
+                Cleanup();
+                throw;
+            }
         }
 
         /// <summary>
@@ -312,20 +362,29 @@ namespace Npgsql
             if (cancellationToken.IsCancellationRequested)
                 return Task.FromCanceled(cancellationToken);
             using (NoSynchronizationContextScope.Enter())
-                return WriteNull(true);
+                return WriteNull(true, cancellationToken);
         }
 
-        async Task WriteNull(bool async)
+        async Task WriteNull(bool async, CancellationToken cancellationToken = default)
         {
             CheckReady();
             if (_column == -1)
                 throw new InvalidOperationException("A row hasn't been started");
 
-            if (_buf.WriteSpaceLeft < 4)
-                await _buf.Flush(async);
+            try
+            {
+                if (_buf.WriteSpaceLeft < 4)
+                    await _buf.Flush(async, cancellationToken);
 
-            _buf.WriteInt32(-1);
-            _column++;
+                _buf.WriteInt32(-1);
+                _column++;
+            }
+            catch
+            {
+                // An exception here will have already broken the connection etc.
+                Cleanup();
+                throw;
+            }
         }
 
         /// <summary>
@@ -334,28 +393,36 @@ namespace Npgsql
         /// on each value.
         /// </summary>
         /// <param name="values">An array of column values to be written as a single row</param>
-        public void WriteRow(params object[] values) => WriteRow(false, values).GetAwaiter().GetResult();
+        public void WriteRow(params object[] values) => WriteRow(false, CancellationToken.None, values).GetAwaiter().GetResult();
 
         /// <summary>
         /// Writes an entire row of columns.
         /// Equivalent to calling <see cref="StartRow()"/>, followed by multiple <see cref="Write{T}(T)"/>
         /// on each value.
         /// </summary>
-        /// <param name="cancellationToken"></param>
+        /// <param name="cancellationToken">
+        /// An optional token to cancel the asynchronous operation. The default value is <see cref="CancellationToken.None"/>.
+        /// </param>
         /// <param name="values">An array of column values to be written as a single row</param>
         public Task WriteRowAsync(CancellationToken cancellationToken = default, params object[] values)
         {
             if (cancellationToken.IsCancellationRequested)
                 return Task.FromCanceled(cancellationToken);
             using (NoSynchronizationContextScope.Enter())
-                return WriteRow(true, values);
+                return WriteRow(true, cancellationToken, values);
         }
 
-        async Task WriteRow(bool async, params object[] values)
+        async Task WriteRow(bool async, CancellationToken cancellationToken = default, params object[] values)
         {
-            await StartRow(async);
+            await StartRow(async, cancellationToken);
             foreach (var value in values)
-                await Write(value, async);
+                await Write(value, async, cancellationToken);
+        }
+
+        void CheckColumnIndex()
+        {
+            if (_column >= NumColumns)
+                ThrowHelper.ThrowInvalidOperationException_BinaryImportParametersMismatch(NumColumns, _column + 1);
         }
 
         #endregion
@@ -365,7 +432,7 @@ namespace Npgsql
         /// <summary>
         /// Completes the import operation. The writer is unusable after this operation.
         /// </summary>
-        public void Complete() => Complete(false).GetAwaiter().GetResult();
+        public ulong Complete() => Complete(false).GetAwaiter().GetResult();
 
         /// <summary>
         /// Completes the import operation. The writer is unusable after this operation.
@@ -375,26 +442,28 @@ namespace Npgsql
             if (cancellationToken.IsCancellationRequested)
                 return new ValueTask<ulong>(Task.FromCanceled<ulong>(cancellationToken));
             using (NoSynchronizationContextScope.Enter())
-                return Complete(true);
+                return Complete(true, cancellationToken);
         }
 
-        async ValueTask<ulong> Complete(bool async)
+        async ValueTask<ulong> Complete(bool async, CancellationToken cancellationToken = default)
         {
             CheckReady();
 
+            using var registration = _connector.StartNestedCancellableOperation(cancellationToken, attemptPgCancellation: false);
+
             if (InMiddleOfRow)
             {
-                await Cancel(async);
+                await Cancel(async, cancellationToken);
                 throw new InvalidOperationException("Binary importer closed in the middle of a row, cancelling import.");
             }
 
             try
             {
-                await WriteTrailer(async);
-                await _buf.Flush(async);
+                await WriteTrailer(async, cancellationToken);
+                await _buf.Flush(async, cancellationToken);
                 _buf.EndCopyMode();
-                await _connector.WriteCopyDone(async);
-                await _connector.Flush(async);
+                await _connector.WriteCopyDone(async, cancellationToken);
+                await _connector.Flush(async, cancellationToken);
                 var cmdComplete = Expect<CommandCompleteMessage>(await _connector.ReadMessage(async), _connector);
                 Expect<ReadyForQueryMessage>(await _connector.ReadMessage(async), _connector);
                 _state = ImporterState.Committed;
@@ -425,19 +494,20 @@ namespace Npgsql
                 return CloseAsync(true);
         }
 
-        async Task Cancel(bool async)
+        async Task Cancel(bool async, CancellationToken cancellationToken = default)
         {
             _state = ImporterState.Cancelled;
             _buf.Clear();
             _buf.EndCopyMode();
-            await _connector.WriteCopyFail(async);
-            await _connector.Flush(async);
+            await _connector.WriteCopyFail(async, cancellationToken);
+            await _connector.Flush(async, cancellationToken);
             try
             {
+                using var registration = _connector.StartNestedCancellableOperation(cancellationToken, attemptPgCancellation: false);
                 var msg = await _connector.ReadMessage(async);
                 // The CopyFail should immediately trigger an exception from the read above.
-                _connector.Break();
-                throw new NpgsqlException("Expected ErrorResponse when cancelling COPY but got: " + msg.Code);
+                throw _connector.Break(
+                    new NpgsqlException("Expected ErrorResponse when cancelling COPY but got: " + msg.Code));
             }
             catch (PostgresException e)
             {
@@ -449,7 +519,6 @@ namespace Npgsql
         /// <summary>
         /// Completes the import process and signals to the database to write everything.
         /// </summary>
-        [PublicAPI]
         public void Close() => CloseAsync(false).GetAwaiter().GetResult();
 
         /// <summary>
@@ -457,23 +526,22 @@ namespace Npgsql
         /// </summary>
         /// <returns></returns>
         /// <exception cref="Exception"></exception>
-        [PublicAPI]
         public ValueTask CloseAsync(CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
                 return new ValueTask(Task.FromCanceled(cancellationToken));
             using (NoSynchronizationContextScope.Enter())
-                return CloseAsync(true);
+                return CloseAsync(true, cancellationToken);
         }
 
-        async ValueTask CloseAsync(bool async)
+        async ValueTask CloseAsync(bool async, CancellationToken cancellationToken = default)
         {
             switch (_state)
             {
             case ImporterState.Disposed:
                 return;
             case ImporterState.Ready:
-                await Cancel(async);
+                await Cancel(async, cancellationToken);
                 break;
             case ImporterState.Cancelled:
             case ImporterState.Committed:
@@ -482,9 +550,8 @@ namespace Npgsql
                 throw new Exception("Invalid state: " + _state);
             }
 
-            var connector = _connector;
+            _connector.EndUserAction();
             Cleanup();
-            connector.EndUserAction();
         }
 
 #pragma warning disable CS8625
@@ -496,6 +563,7 @@ namespace Npgsql
             if (connector != null)
             {
                 connector.CurrentCopyOperation = null;
+                _connector.Connection?.EndBindingScope(ConnectorBindingScope.Copy);
                 _connector = null;
             }
 
@@ -504,10 +572,10 @@ namespace Npgsql
         }
 #pragma warning restore CS8625
 
-        async Task WriteTrailer(bool async)
+        async Task WriteTrailer(bool async, CancellationToken cancellationToken = default)
         {
             if (_buf.WriteSpaceLeft < 2)
-                await _buf.Flush(async);
+                await _buf.Flush(async, cancellationToken);
             _buf.WriteInt16(-1);
         }
 

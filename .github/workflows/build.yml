@@ -1,0 +1,217 @@
+name: Build
+
+on: [push, pull_request]
+
+env:
+  dotnet_sdk_version: '5.0.100'
+  postgis_version: 3
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-20.04, windows-2019 ]
+        pg_major: [ 13, 12, 11, 10 ]
+# For when a PG14 prerelease comes out:
+#        include:
+#          - os: ubuntu-20.04
+#            pg_major: 14
+#            pg_prerelease: prerelease
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: NuGet Cache
+        uses: actions/cache@v2
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/Directory.Build.targets') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Setup .NET Core SDK
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: ${{ env.dotnet_sdk_version }}
+
+      - name: Build
+        run: dotnet build
+        shell: bash
+
+      - name: Start PostgreSQL ${{ matrix.pg_major }} (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          # First uninstall any PostgreSQL installed on the image
+          dpkg-query -W --showformat='${Package}\n' 'postgresql-*' | xargs sudo dpkg -P postgresql
+
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt/ focal-pgdg main 13" >> /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update -qq
+          sudo apt-get install -qq postgresql-${{ matrix.pg_major }}
+          sudo -u postgres psql -c "CREATE USER npgsql_tests SUPERUSER PASSWORD 'npgsql_tests'"
+          sudo -u postgres psql -c "CREATE DATABASE npgsql_tests OWNER npgsql_tests"
+          sudo -u postgres psql -c "CREATE EXTENSION citext" npgsql_tests
+          sudo -u postgres psql -c "CREATE EXTENSION hstore" npgsql_tests
+          sudo -u postgres psql -c "CREATE EXTENSION ltree" npgsql_tests
+
+          # To disable PostGIS for prereleases (because it usually isn't available until late), surround with the following:
+          # if [ -z "${{ matrix.pg_prerelease }}" ]; then
+            sudo apt-get install -qq postgresql-${{ matrix.pg_major }}-postgis-${{ env.postgis_version }}
+            sudo -u postgres psql -c "CREATE EXTENSION postgis" npgsql_tests
+
+          export PGDATA=/etc/postgresql/${{ matrix.pg_major }}/main
+          sudo sed -i 's/#ssl = off/ssl = on/' $PGDATA/postgresql.conf
+          sudo sed -i 's/#max_prepared_transactions = 0/max_prepared_transactions = 10/' $PGDATA/postgresql.conf
+          sudo sed -i 's/#password_encryption = md5/password_encryption = scram-sha-256/' $PGDATA/postgresql.conf
+          sudo sed -i 's/#wal_level =/wal_level = logical #/' $PGDATA/postgresql.conf
+          sudo sed -i 's/#max_wal_senders =/max_wal_senders = 50 #/' $PGDATA/postgresql.conf
+          sudo sed -i 's/#wal_sender_timeout =/wal_sender_timeout = 3s #/' $PGDATA/postgresql.conf
+          sudo sed -i "s/#synchronous_standby_names =/synchronous_standby_names = 'npgsql_test_sync_standby' #/" $PGDATA/postgresql.conf
+          sudo sed -i "s/#synchronous_commit =/synchronous_commit = local #/" $PGDATA/postgresql.conf
+          # Disable trust authentication, requiring MD5 passwords - some tests must fail if a password isn't provided.
+          sudo sh -c "echo 'local all all trust' > $PGDATA/pg_hba.conf"
+          sudo sh -c "echo 'host all npgsql_tests_scram all scram-sha-256' >> $PGDATA/pg_hba.conf"
+          sudo sh -c "echo 'host all all all md5' >> $PGDATA/pg_hba.conf"
+          sudo sh -c "echo 'host replication all all md5' >> $PGDATA/pg_hba.conf"
+          sudo pg_ctlcluster ${{ matrix.pg_major }} main restart
+
+          # user 'npgsql_tests_scram' must be created with password encrypted as scram-sha-256 (which only applies after restart)
+          sudo -u postgres psql -c "CREATE USER npgsql_tests_scram SUPERUSER PASSWORD 'npgsql_tests_scram'"
+
+      - name: Start PostgreSQL ${{ matrix.pg_major }} (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          # Find EnterpriseDB version number
+          EDB_VERSION=$(pwsh -c "
+              \$global:progressPreference='silentlyContinue';
+              Invoke-WebRequest -URI https://www.postgresql.org/applications-v2.xml |
+                  Select-Object -ExpandProperty Content |
+                  Select-Xml -XPath '/applications/application[id=\"postgresql_${{ matrix.pg_major }}\" and platform=\"windows-x64\"]/version/text()' |
+                  Select-Object -First 1 -ExpandProperty Node |
+                  Select-Object -ExpandProperty Value")
+
+          # Install PostgreSQL
+          echo "Installing PostgreSQL (version: ${EDB_VERSION})"
+          curl -o pgsql.zip -L https://get.enterprisedb.com/postgresql/postgresql-${EDB_VERSION}-windows-x64-binaries.zip
+          unzip pgsql.zip -x 'pgsql/include/**' 'pgsql/doc/**' 'pgsql/pgAdmin 4/**' 'pgsql/StackBuilder/**'
+
+          # Match Npgsql CI Docker image and stash one level up
+          cp {$GITHUB_WORKSPACE/.build,pgsql}/server.crt
+          cp {$GITHUB_WORKSPACE/.build,pgsql}/server.key
+
+          # Find OSGEO version number
+          OSGEO_VERSION=$(\
+            curl -Ls https://download.osgeo.org/postgis/windows/pg${{ matrix.pg_major }} |
+            sed -n 's/.*>postgis-bundle-pg${{ matrix.pg_major }}-\(${{ env.postgis_version }}.[0-9]*.[0-9]*\)x64.zip<.*/\1/p' |
+            tail -n 1)
+
+          # Install PostGIS
+          echo "Installing PostGIS (version: ${OSGEO_VERSION})"
+          POSTGIS_FILE="postgis-bundle-pg${{ matrix.pg_major }}-${OSGEO_VERSION}x64"
+          curl -o postgis.zip -L https://download.osgeo.org/postgis/windows/pg${{ matrix.pg_major }}/${POSTGIS_FILE}.zip
+          unzip postgis.zip -d postgis
+          cp -a postgis/$POSTGIS_FILE/. pgsql/
+
+          # Start PostgreSQL
+          pgsql/bin/initdb -D pgsql/PGDATA -E UTF8 -U postgres
+          SOCKET_DIR=$(echo "$LOCALAPPDATA\Temp" | sed 's|\\|/|g')
+          sed -i "s|#unix_socket_directories = ''|unix_socket_directories = '$SOCKET_DIR'|" pgsql/PGDATA/postgresql.conf
+          sed -i "s|#wal_level =|wal_level = logical #|" pgsql/PGDATA/postgresql.conf
+          sed -i "s|#max_wal_senders =|max_wal_senders = 50 #|" pgsql/PGDATA/postgresql.conf
+          sed -i "s|#wal_sender_timeout =|wal_sender_timeout = 3s #|" pgsql/PGDATA/postgresql.conf
+          sed -i "s|#synchronous_standby_names =|synchronous_standby_names = 'npgsql_test_sync_standby' #|" pgsql/PGDATA/postgresql.conf
+          sed -i "s|#synchronous_commit =|synchronous_commit = local #|" pgsql/PGDATA/postgresql.conf
+          pgsql/bin/pg_ctl -D pgsql/PGDATA -l logfile -o '-c max_prepared_transactions=10 -c ssl=true -c ssl_cert_file=../server.crt -c ssl_key_file=../server.key' start
+
+          # Configure test account
+          pgsql/bin/psql -U postgres -c "CREATE ROLE npgsql_tests SUPERUSER LOGIN PASSWORD 'npgsql_tests'"
+          pgsql/bin/psql -U postgres -c "CREATE DATABASE npgsql_tests OWNER npgsql_tests"
+          pgsql/bin/psql -U postgres -c "CREATE EXTENSION citext" npgsql_tests
+          pgsql/bin/psql -U postgres -c "CREATE EXTENSION hstore" npgsql_tests
+          pgsql/bin/psql -U postgres -c "CREATE EXTENSION ltree" npgsql_tests
+          pgsql/bin/psql -U postgres -c "CREATE EXTENSION postgis" npgsql_tests
+
+          # user 'npgsql_tests_scram' must be created with password encrypted as scram-sha-256 (which only applies after restart)
+          sed -i "s|#password_encryption = md5|password_encryption = scram-sha-256|" pgsql/PGDATA/postgresql.conf
+
+          pgsql/bin/pg_ctl -D pgsql/PGDATA -l logfile -o '-c max_prepared_transactions=10 -c ssl=true -c ssl_cert_file=../server.crt -c ssl_key_file=../server.key' restart
+
+          pgsql/bin/psql -U postgres -c "CREATE ROLE npgsql_tests_scram SUPERUSER LOGIN PASSWORD 'npgsql_tests_scram'"
+
+          # Disable trust authentication except for unix domain sockets, requiring MD5
+          # passwords - some tests must fail if a password isn't provided.
+          if [ ${{ matrix.pg_major }} -ge 13 ]; then
+                echo "local all all trust" > pgsql/PGDATA/pg_hba.conf
+                echo "host all npgsql_tests_scram all scram-sha-256" >> pgsql/PGDATA/pg_hba.conf
+          else
+                echo "host all npgsql_tests_scram all scram-sha-256" > pgsql/PGDATA/pg_hba.conf
+          fi
+          echo "host all all all md5" >> pgsql/PGDATA/pg_hba.conf
+          echo "host replication all all md5" >> pgsql/PGDATA/pg_hba.conf
+
+      # TODO: Once test/Npgsql.Specification.Tests work, switch to just testing on the solution
+      - name: Test
+        run: dotnet test test/Npgsql.Tests --logger "GitHubActions;report-warnings=false"
+        shell: bash
+
+      - name: Test Plugins
+        run: dotnet test test/Npgsql.PluginTests --logger "GitHubActions;report-warnings=false"
+        shell: bash
+
+  publish:
+    needs: build
+
+    runs-on: windows-latest
+
+    if: github.event_name == 'push' && github.repository == 'npgsql/npgsql'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: NuGet Cache
+        uses: actions/cache@v2
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/Directory.Build.targets') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Setup .NET Core SDK
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: ${{ env.dotnet_sdk_version }}
+
+      - name: Pack NuGet packages (CI versions)
+        if: startsWith(github.ref, 'refs/heads/')
+        run: dotnet pack Npgsql.sln --configuration Release --output nupkgs --version-suffix "ci.$(date -u +%Y%m%dT%H%M%S)+sha.${GITHUB_SHA:0:9}" -p:ContinuousIntegrationBuild=true
+        shell: bash
+
+      - name: Pack NuGet packages (Release versions)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: dotnet pack Npgsql.sln --configuration Release --output nupkgs -p:ContinuousIntegrationBuild=true
+        shell: bash
+
+      - name: Upload artifacts (nupkg)
+        uses: actions/upload-artifact@v2
+        with:
+          name: Npgsql.nupkgs
+          path: nupkgs
+
+      - name: Publish packages to MyGet (vnext)
+        if: startsWith(github.ref, 'refs/heads/') && startsWith(github.ref, 'refs/heads/hotfix/') == false
+        run: dotnet nuget push "*.nupkg" --api-key ${{ secrets.MYGET_FEED_TOKEN }} --source https://www.myget.org/F/npgsql-unstable/api/v3/index.json
+        working-directory: nupkgs
+        shell: bash
+
+      - name: Publish packages to MyGet (patch)
+        if: startsWith(github.ref, 'refs/heads/hotfix/')
+        run: dotnet nuget push "*.nupkg" --api-key ${{ secrets.MYGET_FEED_TOKEN }} --source https://www.myget.org/F/npgsql/api/v3/index.json
+        working-directory: nupkgs
+        shell: bash

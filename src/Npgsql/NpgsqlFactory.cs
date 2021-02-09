@@ -11,13 +11,11 @@ namespace Npgsql
     [Serializable]
     public sealed class NpgsqlFactory : DbProviderFactory, IServiceProvider
     {
-        static readonly NpgsqlLogger Log = NpgsqlLogManager.CreateLogger(nameof(NpgsqlFactory));
-
         /// <summary>
         /// Gets an instance of the <see cref="NpgsqlFactory"/>.
         /// This can be used to retrieve strongly typed data objects.
         /// </summary>
-        public static readonly NpgsqlFactory Instance = new NpgsqlFactory();
+        public static readonly NpgsqlFactory Instance = new();
 
         NpgsqlFactory() {}
 
@@ -51,7 +49,7 @@ namespace Npgsql
         /// </summary>
         public override DbDataAdapter CreateDataAdapter() => new NpgsqlDataAdapter();
 
-#if !NET461 && !NETSTANDARD2_0
+#if !NETSTANDARD2_0
         /// <summary>
         /// Specifies whether the specific <see cref="DbProviderFactory"/> supports the <see cref="DbDataAdapter"/> class.
         /// </summary>
@@ -93,8 +91,7 @@ namespace Npgsql
             Assembly npgsqlEfAssembly;
             try {
                 npgsqlEfAssembly = Assembly.Load(new AssemblyName(assemblyName.FullName));
-            } catch (Exception e) {
-                Log.Debug("A service request was made for System.Data.Common.DbProviderServices, but the EntityFramework5.Npgsql assemby could not be loaded.", e);
+            } catch {
                 return null;
             }
 

@@ -1,6 +1,4 @@
-﻿using JetBrains.Annotations;
-
-namespace Npgsql.PostgresTypes
+﻿namespace Npgsql.PostgresTypes
 {
     /// <summary>
     /// Represents a PostgreSQL domain type.
@@ -18,16 +16,21 @@ namespace Npgsql.PostgresTypes
         /// <summary>
         /// The PostgreSQL data type of the base type, i.e. the type this domain is based on.
         /// </summary>
-        [PublicAPI]
         public PostgresType BaseType { get; }
+
+        /// <summary>
+        /// <b>True</b> if the domain has a NOT NULL constraint, otherwise <b>false</b>.
+        /// </summary>
+        public bool NotNull { get; }
 
         /// <summary>
         /// Constructs a representation of a PostgreSQL domain data type.
         /// </summary>
-        protected internal PostgresDomainType(string ns, string name, uint oid, PostgresType baseType)
+        protected internal PostgresDomainType(string ns, string name, uint oid, PostgresType baseType, bool notNull)
             : base(ns, name, oid)
         {
             BaseType = baseType;
+            NotNull = notNull;
         }
 
         internal override PostgresFacets GetFacets(int typeModifier)
